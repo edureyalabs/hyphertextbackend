@@ -3,7 +3,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import asyncio
-from db import get_page
+from database import get_page
 from agents import run_create_agent, run_edit_agent
 from boilerplate import INITIAL_BOILERPLATE
 
