@@ -189,7 +189,7 @@ def get_page_assets_ready(page_id: str) -> list:
         .select("*")
         .eq("page_id", page_id)
         .eq("processing_status", "ready")
-        .order("created_at", ascending=True)
+        .order("created_at", desc=False)
         .execute()
     )
     return res.data or []
