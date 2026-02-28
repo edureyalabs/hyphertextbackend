@@ -1,8 +1,9 @@
+# main.py
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import asyncio
-from database import get_page, resolve_clarification, get_pending_clarification
+from database import get_page
 from agents.orchestrator import run_orchestrator
 from boilerplate import INITIAL_BOILERPLATE
 from config import DEFAULT_MODEL, ALL_MODELS
@@ -24,10 +25,6 @@ class AgentRunRequest(BaseModel):
     model_id: str = DEFAULT_MODEL
 
 
-class ModelsResponse(BaseModel):
-    models: list
-
-
 @app.get("/")
 def health():
     return {"status": "ok", "service": "hyphertext-agent"}
@@ -47,12 +44,16 @@ async def agent_run(req: AgentRunRequest):
 
         model_id = req.model_id if req.model_id in ALL_MODELS else DEFAULT_MODEL
 
+        # owner_id is needed by the asset pipeline to upload extracted images
+        owner_id = page.get("owner_id")
+
         asyncio.create_task(
             run_orchestrator(
                 page_id=req.page_id,
                 message_id=req.message_id,
                 user_prompt=req.content,
-                model_id=model_id
+                model_id=model_id,
+                owner_id=owner_id,
             )
         )
 

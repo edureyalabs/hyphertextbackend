@@ -1,8 +1,11 @@
+# agents/orchestrator.py
 import json
 from agents.models import router as model_router
 from agents.tools.html_tools import TOOL_DEFINITIONS, execute_str_replace
 from agents.tools.search_tools import brave_search, format_search_results
 from agents.knowledge.prompts import build_orchestrator_system_prompt, build_planning_prompt
+from agents.processors.asset_pipeline import process_pending_assets
+from agents.processors.asset_context import build_asset_context
 from database import (
     get_page,
     update_page_html,
@@ -16,7 +19,7 @@ from database import (
     insert_edit_history,
     insert_clarification,
     get_pending_clarification,
-    resolve_clarification
+    resolve_clarification,
 )
 from boilerplate import INITIAL_BOILERPLATE
 
@@ -53,7 +56,7 @@ def _parse_plan(raw: str) -> dict:
         }
 
 
-async def run_orchestrator(page_id: str, message_id: str, user_prompt: str, model_id: str):
+async def run_orchestrator(page_id: str, message_id: str, user_prompt: str, model_id: str, owner_id: str = None):
     tokens_used = 0
     web_searches_used = []
     changes_log = []
@@ -63,6 +66,16 @@ async def run_orchestrator(page_id: str, message_id: str, user_prompt: str, mode
     try:
         update_message_status(message_id, "processing")
 
+        # ── STEP 1: process any pending assets BEFORE building context ─────────
+        # This runs vision/extraction on files uploaded with this message.
+        # Only processes assets that are still in 'pending' state.
+        if owner_id:
+            await process_pending_assets(page_id, owner_id)
+
+        # ── STEP 2: build asset context string ────────────────────────────────
+        asset_context = build_asset_context(page_id)
+
+        # ── STEP 3: load page + history ───────────────────────────────────────
         page = get_page(page_id)
         current_html = page.get("html_content", "")
         html_summary = page.get("html_summary", "")
@@ -71,6 +84,7 @@ async def run_orchestrator(page_id: str, message_id: str, user_prompt: str, mode
         edit_history = get_edit_history(page_id, limit=5)
         chat_history = get_chat_history(page_id, limit=8)
 
+        # ── STEP 4: handle pending clarification ──────────────────────────────
         pending_clarification = get_pending_clarification(page_id)
         if pending_clarification:
             resolve_clarification(pending_clarification["id"], user_prompt)
@@ -82,6 +96,7 @@ async def run_orchestrator(page_id: str, message_id: str, user_prompt: str, mode
 
         is_new_page = _is_boilerplate(current_html)
 
+        # ── STEP 5: planning ──────────────────────────────────────────────────
         planning_messages = [
             {
                 "role": "system",
@@ -137,6 +152,7 @@ async def run_orchestrator(page_id: str, message_id: str, user_prompt: str, mode
 
         insert_thinking_message(page_id, plan)
 
+        # ── STEP 6: optional web search ───────────────────────────────────────
         if plan.get("needs_web_search") and plan.get("search_query"):
             search_results = await brave_search(plan["search_query"])
             web_searches_used.append({
@@ -147,6 +163,7 @@ async def run_orchestrator(page_id: str, message_id: str, user_prompt: str, mode
         else:
             search_context = ""
 
+        # ── STEP 7: build system prompt with asset context injected ───────────
         system_prompt = build_orchestrator_system_prompt(
             current_html=current_html,
             html_summary=html_summary,
@@ -155,18 +172,22 @@ async def run_orchestrator(page_id: str, message_id: str, user_prompt: str, mode
             chat_history=chat_history
         )
 
+        # inject asset context right after the base system prompt
+        if asset_context:
+            system_prompt = system_prompt + f"\n\n{asset_context}"
+
         if search_context:
-            system_prompt += f"\n\n{search_context}"
+            system_prompt = system_prompt + f"\n\n{search_context}"
 
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ]
 
+        # ── STEP 8: agentic tool loop ─────────────────────────────────────────
         max_iterations = 15
         iteration = 0
         final_summary = "Done."
-        final_component_ids = []
 
         while iteration < max_iterations:
             iteration += 1
@@ -189,13 +210,13 @@ async def run_orchestrator(page_id: str, message_id: str, user_prompt: str, mode
 
             for tool_call in response["tool_calls"]:
                 fn_name = tool_call["name"]
-                args = tool_call["arguments"]
-                tc_id = tool_call["id"]
+                args    = tool_call["arguments"]
+                tc_id   = tool_call["id"]
 
                 if fn_name == "write_full_file":
                     html = args.get("html", "")
                     summary = args.get("summary", "Page created.")
-                    new_html_summary = args.get("html_summary", "")
+                    new_html_summary  = args.get("html_summary", "")
                     new_component_map = args.get("component_map", [])
 
                     if not html:
@@ -210,15 +231,8 @@ async def run_orchestrator(page_id: str, message_id: str, user_prompt: str, mode
 
                     if new_html_summary:
                         update_page_summary_and_map(page_id, new_html_summary, new_component_map)
-                        html_summary = new_html_summary
-                        component_map = new_component_map
 
-                    changes_log.append({
-                        "tool": "write_full_file",
-                        "summary": summary,
-                        "success": True
-                    })
-
+                    changes_log.append({"tool": "write_full_file", "summary": summary, "success": True})
                     final_summary = summary
                     snapshot_version(page_id, html)
                     update_message_status(message_id, "completed")
@@ -246,21 +260,10 @@ async def run_orchestrator(page_id: str, message_id: str, user_prompt: str, mode
                     if success:
                         current_html = updated_html
                         update_page_html(page_id, current_html)
-                        changes_log.append({
-                            "tool": "str_replace",
-                            "old_str_preview": old_str[:80],
-                            "success": True
-                        })
-                        tool_results_for_messages.append({
-                            "tool_call_id": tc_id,
-                            "result": "replaced successfully"
-                        })
+                        changes_log.append({"tool": "str_replace", "old_str_preview": old_str[:80], "success": True})
+                        tool_results_for_messages.append({"tool_call_id": tc_id, "result": "replaced successfully"})
                     else:
-                        changes_log.append({
-                            "tool": "str_replace",
-                            "old_str_preview": old_str[:80],
-                            "success": False
-                        })
+                        changes_log.append({"tool": "str_replace", "old_str_preview": old_str[:80], "success": False})
                         tool_results_for_messages.append({
                             "tool_call_id": tc_id,
                             "result": (
@@ -301,14 +304,10 @@ async def run_orchestrator(page_id: str, message_id: str, user_prompt: str, mode
                     search_results = await brave_search(query)
                     web_searches_used.append({"query": query, "results": search_results})
                     formatted = format_search_results(search_results)
-                    tool_results_for_messages.append({
-                        "tool_call_id": tc_id,
-                        "result": formatted
-                    })
+                    tool_results_for_messages.append({"tool_call_id": tc_id, "result": formatted})
 
                 elif fn_name == "finish":
                     final_summary = args.get("summary", "Edits complete.")
-                    final_component_ids = args.get("updated_component_ids", [])
                     snapshot_version(page_id, current_html)
                     update_message_status(message_id, "completed")
                     insert_assistant_message(page_id, final_summary)
@@ -327,6 +326,7 @@ async def run_orchestrator(page_id: str, message_id: str, user_prompt: str, mode
                     )
                     return
 
+            # append assistant + tool results to message history
             assistant_msg = {
                 "role": "assistant",
                 "content": response["content"] or "",
@@ -351,6 +351,7 @@ async def run_orchestrator(page_id: str, message_id: str, user_prompt: str, mode
                     "content": result["result"]
                 })
 
+        # exited loop without hitting a return — save whatever we have
         snapshot_version(page_id, current_html)
         update_message_status(message_id, "completed")
         insert_assistant_message(page_id, final_summary)
