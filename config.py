@@ -16,8 +16,8 @@ GROQ_MODELS = {
 }
 
 CLAUDE_MODELS = {
-    "claude/claude-sonnet-4-5": "claude-sonnet-4-5-20251001",
-    "claude/claude-haiku-4-5": "claude-haiku-4-5-20251001",
+    "claude/claude-sonnet-4-5": "claude-sonnet-4-5",
+    "claude/claude-haiku-4-5": "claude-haiku-4-5",
 }
 
 ALL_MODELS = list(GROQ_MODELS.keys()) + list(CLAUDE_MODELS.keys())
