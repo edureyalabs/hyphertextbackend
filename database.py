@@ -1,4 +1,3 @@
-# database.py
 from supabase import create_client, Client
 from config import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 from typing import Optional
@@ -7,11 +6,10 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 
 def get_supabase_client() -> Client:
-    """Expose the shared client for use in processors."""
     return supabase
 
 
-# ─── Pages ───────────────────────────────────────────────────────────────────
+# Pages
 
 def get_page(page_id: str) -> dict:
     res = supabase.table("pages").select("*").eq("id", page_id).single().execute()
@@ -33,19 +31,37 @@ def update_page_summary_and_map(page_id: str, html_summary: str, component_map: 
     }).eq("id", page_id).execute()
 
 
-# ─── Chat ────────────────────────────────────────────────────────────────────
+# Chat
 
 def get_chat_history(page_id: str, limit: int = 10) -> list:
     res = (
         supabase.table("chat_messages")
-        .select("role, content, message_type, meta")
+        .select("role, content, message_type, meta, status")
         .eq("page_id", page_id)
-        .eq("status", "completed")
+        .in_("message_type", ["chat", "clarification"])
         .order("created_at", desc=True)
         .limit(limit)
         .execute()
     )
     return list(reversed(res.data))
+
+
+def get_consecutive_clarification_count(page_id: str) -> int:
+    res = (
+        supabase.table("clarification_threads")
+        .select("id, resolved")
+        .eq("page_id", page_id)
+        .order("created_at", desc=True)
+        .limit(5)
+        .execute()
+    )
+    count = 0
+    for row in res.data:
+        if not row["resolved"]:
+            count += 1
+        else:
+            break
+    return count
 
 
 def update_message_status(message_id: str, status: str):
@@ -77,7 +93,7 @@ def insert_thinking_message(page_id: str, plan: dict) -> str:
     return res.data[0]["id"] if res.data else None
 
 
-def snapshot_version(page_id: str, html: str):
+def snapshot_version(page_id: str, html: str, trigger_type: str = "agent_complete"):
     res = (
         supabase.table("page_versions")
         .select("version_num")
@@ -92,8 +108,31 @@ def snapshot_version(page_id: str, html: str):
         "page_id": page_id,
         "html_snapshot": html,
         "version_num": next_version,
-        "trigger_type": "agent_complete"
+        "trigger_type": trigger_type
     }).execute()
+
+
+def get_page_versions(page_id: str, limit: int = 10) -> list:
+    res = (
+        supabase.table("page_versions")
+        .select("id, version_num, trigger_type, created_at")
+        .eq("page_id", page_id)
+        .order("version_num", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return res.data or []
+
+
+def get_version_html(version_id: str) -> Optional[str]:
+    res = (
+        supabase.table("page_versions")
+        .select("html_snapshot")
+        .eq("id", version_id)
+        .single()
+        .execute()
+    )
+    return res.data["html_snapshot"] if res.data else None
 
 
 def get_edit_history(page_id: str, limit: int = 5) -> list:
@@ -119,7 +158,8 @@ def insert_edit_history(
     web_searches_used: list,
     model_used: str,
     tokens_used: int,
-    success: bool
+    success: bool,
+    owner_id: str = None
 ):
     supabase.table("edit_history").insert({
         "page_id": page_id,
@@ -132,7 +172,8 @@ def insert_edit_history(
         "web_searches_used": web_searches_used,
         "model_used": model_used,
         "tokens_used": tokens_used,
-        "success": success
+        "success": success,
+        "owner_id": owner_id
     }).execute()
 
 
@@ -167,10 +208,9 @@ def get_pending_clarification(page_id: str) -> dict:
     return res.data[0] if res.data else None
 
 
-# ─── Assets ──────────────────────────────────────────────────────────────────
+# Assets
 
 def get_pending_assets_for_page(page_id: str) -> list:
-    """Return all assets in 'pending' status for a page (top-level only)."""
     res = (
         supabase.table("page_assets")
         .select("*")
@@ -183,7 +223,6 @@ def get_pending_assets_for_page(page_id: str) -> list:
 
 
 def get_page_assets_ready(page_id: str) -> list:
-    """Return all 'ready' assets for a page (including extracted children)."""
     res = (
         supabase.table("page_assets")
         .select("*")
@@ -259,7 +298,6 @@ def insert_extracted_image_asset(
     height: int,
     file_size_bytes: int,
 ) -> Optional[str]:
-    """Insert a child image asset extracted from a document. Returns new asset id."""
     res = supabase.table("page_assets").insert({
         "page_id": page_id,
         "owner_id": owner_id,
@@ -273,6 +311,54 @@ def insert_extracted_image_asset(
         "width": width,
         "height": height,
         "file_size_bytes": file_size_bytes,
-        "processing_status": "processing",  # will be updated by vision call right after
+        "processing_status": "processing",
     }).execute()
     return res.data[0]["id"] if res.data else None
+
+
+# Tokens
+
+def deduct_tokens(user_id: str, amount: int, description: str, reference_id: str = None) -> dict:
+    res = supabase.rpc("deduct_tokens", {
+        "p_user_id": user_id,
+        "p_amount": amount,
+        "p_description": description,
+        "p_reference_id": reference_id
+    }).execute()
+    return res.data or {"success": False, "error": "RPC failed"}
+
+
+def check_token_balance(user_id: str) -> dict:
+    res = supabase.rpc("check_token_balance", {"p_user_id": user_id}).execute()
+    return res.data or {"has_balance": False, "balance": 0}
+
+
+# Subscriptions
+
+def get_user_subscription(user_id: str) -> dict:
+    res = supabase.rpc("get_user_subscription", {"p_user_id": user_id}).execute()
+    return res.data or {}
+
+
+def upgrade_subscription(user_id: str, tier: str, razorpay_order_id: str, razorpay_payment_id: str, amount_usd: float) -> dict:
+    res = supabase.rpc("upgrade_subscription", {
+        "p_user_id": user_id,
+        "p_tier": tier,
+        "p_razorpay_order_id": razorpay_order_id,
+        "p_razorpay_payment_id": razorpay_payment_id,
+        "p_amount_usd": amount_usd
+    }).execute()
+    return res.data or {"success": False}
+
+
+def check_can_publish(user_id: str, page_id: str) -> dict:
+    res = supabase.rpc("check_can_publish", {
+        "p_user_id": user_id,
+        "p_page_id": page_id
+    }).execute()
+    return res.data or {"allowed": False, "reason": "unknown"}
+
+
+def check_can_create_page(user_id: str) -> dict:
+    res = supabase.rpc("check_can_create_page", {"p_user_id": user_id}).execute()
+    return res.data or {"allowed": False, "reason": "unknown"}

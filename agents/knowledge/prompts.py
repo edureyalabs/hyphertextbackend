@@ -15,10 +15,10 @@ def build_orchestrator_system_prompt(
     if component_map:
         lines = []
         for c in component_map:
-            lines.append(f"  - [{c.get('id','')}] {c.get('selector','')} — {c.get('description','')}")
+            lines.append(f"  - [{c.get('id','')}] {c.get('selector','')} -- {c.get('description','')}")
         component_map_str = "\n".join(lines)
 
-    page_summary_str = html_summary if html_summary else "No summary yet. This appears to be a new page."
+    page_summary_str = html_summary if html_summary else "No summary yet. This appears to be a new or recently imported page."
 
     edit_history_str = "No previous edits."
     if edit_history:
@@ -38,9 +38,13 @@ def build_orchestrator_system_prompt(
         for msg in chat_history:
             role = msg.get("role", "")
             content = msg.get("content", "")
-            if len(content) > 200:
-                content = content[:200] + "..."
-            lines.append(f"  {role.upper()}: {content}")
+            msg_type = msg.get("message_type", "chat")
+            if len(content) > 300:
+                content = content[:300] + "..."
+            if msg_type == "clarification":
+                lines.append(f"  ASSISTANT (asked for clarification): {content}")
+            else:
+                lines.append(f"  {role.upper()}: {content}")
         chat_history_str = "\n".join(lines)
 
     return f"""You are an elite HTML/CSS/JS developer. You build stunning, complete, production-quality single-file web pages.
@@ -83,11 +87,13 @@ Use str_replace when:
 - The page already exists and the change is localized
 - User says just, only, slightly, fix, add, remove, update, change
 - Change is isolated to one or a few components
+- The page was imported by the user (always prefer surgical for imported pages)
 
 Use ask_clarification when:
 - The user intent is genuinely ambiguous and the answer would significantly change what you build
 - Cosmetic ambiguity: never ask, decide yourself
 - Ask at most one question, never multiple
+- Do NOT ask if you have already asked a clarification recently -- just proceed with your best judgment
 
 Use web_search when:
 - You need a specific CDN URL or version number you are unsure about
@@ -95,7 +101,7 @@ Use web_search when:
 - Do not search for general HTML/CSS/JS knowledge
 
 PLANNING REQUIREMENT
-Before calling any code tool, you must reason through:
+Before calling any code tool, reason through:
 1. What exactly is being asked
 2. What the simplest complete solution is
 3. Which components will change and in what order
@@ -141,4 +147,27 @@ Respond with a JSON object with these fields:
 }}
 
 Only respond with the JSON object. No explanation. No markdown fences.
+"""
+
+
+def build_summary_generation_prompt(current_html: str) -> str:
+    return f"""Analyze this HTML page and return a JSON object describing it.
+
+HTML:
+{current_html[:6000]}
+
+Return a JSON object with:
+{{
+  "html_summary": "300-500 word description of what this page is, its sections, state shape, and key JS logic",
+  "component_map": [
+    {{
+      "id": "unique_id",
+      "selector": "CSS selector or element description",
+      "type": "section|component|nav|form|etc",
+      "description": "what this component does"
+    }}
+  ]
+}}
+
+Only respond with the JSON object. No markdown fences. No explanation.
 """
