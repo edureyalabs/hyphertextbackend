@@ -169,5 +169,5 @@ Return a JSON object with:
   ]
 }}
 
-Only respond with the JSON object. No markdown fences. No explanation.
+Only respond with the JSON object. No markdown fences. No explanations.
 """
