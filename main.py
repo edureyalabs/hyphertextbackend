@@ -2,11 +2,11 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional
 import asyncio
 from database import get_page
 from agents.orchestrator import run_orchestrator
 from boilerplate import INITIAL_BOILERPLATE
-from config import DEFAULT_MODEL, ALL_MODELS
 
 app = FastAPI(title="Hyphertext Agent Backend")
 
@@ -22,17 +22,14 @@ class AgentRunRequest(BaseModel):
     message_id: str
     page_id: str
     content: str
-    model_id: str = DEFAULT_MODEL
+    # model_id is accepted for backward compatibility with older frontend versions
+    # but is intentionally ignored — model selection is now fully automatic.
+    model_id: Optional[str] = None
 
 
 @app.get("/")
 def health():
     return {"status": "ok", "service": "hyphertext-agent"}
-
-
-@app.get("/models")
-def list_models():
-    return {"models": ALL_MODELS}
 
 
 @app.post("/agent/run")
@@ -42,9 +39,6 @@ async def agent_run(req: AgentRunRequest):
         if not page:
             raise HTTPException(status_code=404, detail="Page not found")
 
-        model_id = req.model_id if req.model_id in ALL_MODELS else DEFAULT_MODEL
-
-        # owner_id is needed by the asset pipeline to upload extracted images
         owner_id = page.get("owner_id")
 
         asyncio.create_task(
@@ -52,12 +46,11 @@ async def agent_run(req: AgentRunRequest):
                 page_id=req.page_id,
                 message_id=req.message_id,
                 user_prompt=req.content,
-                model_id=model_id,
                 owner_id=owner_id,
             )
         )
 
-        return {"status": "accepted", "model": model_id}
+        return {"status": "accepted"}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

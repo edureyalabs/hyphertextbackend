@@ -9,7 +9,7 @@ def get_supabase_client() -> Client:
     return supabase
 
 
-# Pages
+# ── Pages ────────────────────────────────────────────────────────────────────
 
 def get_page(page_id: str) -> dict:
     res = supabase.table("pages").select("*").eq("id", page_id).single().execute()
@@ -31,7 +31,27 @@ def update_page_summary_and_map(page_id: str, html_summary: str, component_map: 
     }).eq("id", page_id).execute()
 
 
-# Chat
+def update_page_coding_model(page_id: str, coding_model_id: str):
+    """
+    Persist the chosen coding model for this page so that all future edits
+    use the same model — ensuring the model that built the page also edits it.
+
+    Requires a `coding_model_id` column on the pages table (TEXT, nullable).
+    Run this migration once:
+        ALTER TABLE pages ADD COLUMN IF NOT EXISTS coding_model_id TEXT;
+    """
+    try:
+        supabase.table("pages").update({
+            "coding_model_id": coding_model_id,
+            "updated_at": "now()"
+        }).eq("id", page_id).execute()
+    except Exception as e:
+        # Non-fatal: if the column doesn't exist yet the orchestrator still
+        # works, just without model persistence across restarts.
+        print(f"[DB] update_page_coding_model failed (column may not exist yet): {e}")
+
+
+# ── Chat ─────────────────────────────────────────────────────────────────────
 
 def get_chat_history(page_id: str, limit: int = 10) -> list:
     res = (
@@ -208,7 +228,7 @@ def get_pending_clarification(page_id: str) -> dict:
     return res.data[0] if res.data else None
 
 
-# Assets
+# ── Assets ───────────────────────────────────────────────────────────────────
 
 def get_pending_assets_for_page(page_id: str) -> list:
     res = (
@@ -316,7 +336,7 @@ def insert_extracted_image_asset(
     return res.data[0]["id"] if res.data else None
 
 
-# Tokens
+# ── Tokens ───────────────────────────────────────────────────────────────────
 
 def deduct_tokens(user_id: str, amount: int, description: str, reference_id: str = None) -> dict:
     res = supabase.rpc("deduct_tokens", {
@@ -333,7 +353,7 @@ def check_token_balance(user_id: str) -> dict:
     return res.data or {"has_balance": False, "balance": 0}
 
 
-# Subscriptions
+# ── Subscriptions ────────────────────────────────────────────────────────────
 
 def get_user_subscription(user_id: str) -> dict:
     res = supabase.rpc("get_user_subscription", {"p_user_id": user_id}).execute()
