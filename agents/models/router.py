@@ -11,8 +11,8 @@ CODING_MODEL_SIMPLE, PLANNING_MODEL, CONVERSATION_MODEL) from config.py.
 This router simply resolves those aliases to the right provider.
 """
 
-from config import GROQ_MODELS, DEEPINFRA_MODELS
-from agents.models import groq_client, deepinfra_client
+from config import GROQ_MODELS, TOGETHER_MODELS
+from agents.models import groq_client, together_client
 
 
 def chat(
@@ -33,10 +33,10 @@ def chat(
         return groq_client.chat(
             model_id, messages, tools, tool_choice, max_tokens, temperature
         )
-    elif model_id in DEEPINFRA_MODELS:
-        return deepinfra_client.chat(
+    elif model_id in TOGETHER_MODELS:
+        return together_client.chat(
             model_id, messages, tools, tool_choice, max_tokens, temperature
         )
     else:
         raise ValueError(f"Unknown model: {model_id!r}. "
-                         f"Valid options: {list(GROQ_MODELS) + list(DEEPINFRA_MODELS)}")
+                         f"Valid options: {list(GROQ_MODELS) + list(TOGETHER_MODELS)}")
