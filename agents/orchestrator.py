@@ -1,18 +1,29 @@
 # agents/orchestrator.py
 """
-Main agent orchestrator.
+Main agent orchestrator for Hyphertext — AI-powered single-file HTML page builder.
 
 Model assignment
 ────────────────────────────────────────────────────────────────────────
-Intent classification  → PLANNING_MODEL   (groq/llama-3.3-70b)
-Planning               → PLANNING_MODEL   (groq/llama-3.3-70b)
-Conversational reply   → CONVERSATION_MODEL (groq/llama-3.1-8b)
-HTML coding — complex  → CODING_MODEL_COMPLEX (deepinfra/glm-5)
-HTML coding — simple   → CODING_MODEL_SIMPLE  (deepinfra/glm-4.7-flash)
+Intent classification  → PLANNING_MODEL      (groq/llama-3.3-70b)
+Planning               → PLANNING_MODEL      (groq/llama-3.3-70b)
+Conversational reply   → CONVERSATION_MODEL  (groq/llama-3.1-8b)
+HTML coding — complex  → CODING_MODEL_COMPLEX (together/glm-5)
+HTML coding — simple   → CODING_MODEL_SIMPLE  (together/glm-4.7-flash)
 
 The coding model is selected ONCE via coding_router.select_coding_model()
-and then stored on the page record (pages.coding_model_id) so that all
-subsequent edits on that page use the same model.
+and then persisted to the page record (pages.coding_model_id) so that all
+subsequent edits on that page use the same model — ensuring the model that
+built the page is also the one that edits it.
+
+Intent routing
+────────────────────────────────────────────────────────────────────────
+conversational  → lightweight reply, redirect toward page building
+revert          → restore prior page version from version history
+code_change     → full agentic tool loop (plan → code → finish)
+
+All user messages that are NOT pure platform meta-questions or greetings
+are treated as code_change. General knowledge questions, topic explanations,
+and ambiguous requests all route to code_change and become HTML pages.
 """
 
 import json
@@ -24,6 +35,8 @@ from agents.knowledge.prompts import (
     build_orchestrator_system_prompt,
     build_planning_prompt,
     build_summary_generation_prompt,
+    build_intent_classification_prompt,
+    build_conversational_reply_prompt,
 )
 from agents.processors.asset_pipeline import process_pending_assets
 from agents.processors.asset_context import build_asset_context
@@ -86,23 +99,49 @@ def _parse_plan(raw: str) -> dict:
         }
 
 
-def _classify_intent(user_prompt: str) -> str:
+def _classify_intent(user_prompt: str, chat_history: list) -> str:
+    """
+    Classify user intent into: conversational | revert | code_change.
+
+    Passes recent chat history so the classifier understands conversational
+    context (e.g. a one-word "thanks!" after a build is clearly conversational,
+    but the same word mid-build might be ambiguous).
+
+    Uses a tight, example-rich system prompt (build_intent_classification_prompt)
+    so the model stays platform-aware and defaults to code_change when uncertain.
+    """
+    # Build a compact chat history string (last 6 exchanges) for context
+    history_context = ""
+    if chat_history:
+        lines = []
+        for msg in chat_history[-6:]:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if len(content) > 150:
+                content = content[:150] + "..."
+            lines.append(f"{role.upper()}: {content}")
+        history_context = "\n".join(lines)
+
     messages = [
         {
             "role": "system",
-            "content": (
-                "You are an intent classifier for an HTML page builder. "
-                "Classify the user message into exactly one of these categories:\n"
-                "- conversational: greetings, thanks, feedback, questions about the platform, "
-                "  general chat, expressions of satisfaction\n"
-                "- revert: user wants to undo, go back, revert, restore a previous version\n"
-                "- code_change: any request to modify, build, create, edit, fix, update, add, "
-                "  remove, or change the page\n"
-                "Reply with only one word: conversational, revert, or code_change"
-            ),
+            "content": build_intent_classification_prompt(),
         },
-        {"role": "user", "content": user_prompt},
     ]
+
+    # Include chat history as context if available
+    if history_context:
+        messages.append({
+            "role": "user",
+            "content": (
+                f"RECENT CONVERSATION CONTEXT (for your reference only):\n"
+                f"{history_context}\n\n"
+                f"NOW CLASSIFY THIS NEW MESSAGE:\n{user_prompt}"
+            ),
+        })
+    else:
+        messages.append({"role": "user", "content": user_prompt})
+
     try:
         response = model_router.chat(
             model_id=PLANNING_MODEL,
@@ -111,9 +150,18 @@ def _classify_intent(user_prompt: str) -> str:
             temperature=0.0,
         )
         result = response["content"].strip().lower()
-        if result in ("conversational", "revert", "code_change"):
-            return result
+
+        # Normalise — model might return "code_change" or "code change" etc.
+        if "revert" in result:
+            return "revert"
+        if "conversational" in result:
+            return "conversational"
+        if "code" in result:
+            return "code_change"
+
+        # Default to code_change — it is always better to build than to chat
         return "code_change"
+
     except Exception:
         return "code_change"
 
@@ -128,34 +176,41 @@ async def _handle_conversational(
     user_prompt: str,
     owner_id: str,
     tokens_used: int,
+    chat_history: list,
+    page_title: str = "",
 ):
+    """
+    Handle genuinely conversational messages: greetings, thanks, platform questions.
+
+    Uses a platform-aware system prompt that redirects off-topic questions
+    back toward building an HTML page.
+    """
+    system_content = build_conversational_reply_prompt(
+        user_prompt=user_prompt,
+        chat_history=chat_history,
+        page_title=page_title,
+    )
+
     messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a helpful assistant for Hyphertext, an AI-powered HTML page builder "
-                "and hosting platform. You help users build, edit, and host single-file HTML pages. "
-                "Be friendly, concise, and encouraging. "
-                "If they ask about capabilities, tell them they can describe any web page and you "
-                "will build it, they can upload images and documents to include in their pages, "
-                "they can publish pages to get a live URL instantly. "
-                "Do not mention code or technical details unless asked."
-            ),
-        },
+        {"role": "system", "content": system_content},
         {"role": "user", "content": user_prompt},
     ]
+
     response = model_router.chat(
         model_id=CONVERSATION_MODEL,
         messages=messages,
-        max_tokens=400,
-        temperature=0.7,
+        max_tokens=300,
+        temperature=0.6,
     )
     tokens_used += response["input_tokens"] + response["output_tokens"]
     reply = response["content"] or "Happy to help! What would you like to build or change?"
+
     update_message_status(message_id, "completed")
     insert_assistant_message(page_id, reply)
+
     if owner_id:
         deduct_tokens(owner_id, tokens_used, "Conversation reply", message_id)
+
     insert_edit_history(
         page_id=page_id,
         message_id=message_id,
@@ -196,7 +251,7 @@ async def _handle_revert(
     update_page_html(page_id, html)
     snapshot_version(page_id, html, trigger_type="revert")
     update_message_status(message_id, "completed")
-    insert_assistant_message(page_id, "Done. I have reverted to the previous version of your page.")
+    insert_assistant_message(page_id, "Done. I've reverted to the previous version of your page.")
     insert_edit_history(
         page_id=page_id,
         message_id=message_id,
@@ -269,16 +324,16 @@ async def run_orchestrator(
     """
     Run the full agent loop for a single user message.
 
-    Note: model_id is NO LONGER a parameter. Model selection is automatic:
-      - Conversation/planning → Groq Llama models (fast, cheap)
-      - HTML coding           → GLM-5 or GLM-4.7-Flash via coding_router
+    Model selection is fully automatic:
+      - Conversation / planning → Groq Llama models (fast, cheap)
+      - HTML coding             → GLM-5 or GLM-4.7-Flash via coding_router
     """
     tokens_used = 0
     web_searches_used = []
     changes_log = []
     plan = {}
     clarification_asked = False
-    coding_model = None  # resolved after planning
+    coding_model = None
 
     try:
         update_message_status(message_id, "processing")
@@ -295,13 +350,33 @@ async def run_orchestrator(
                 )
                 return
 
+        # ── load page + history early (needed for intent classification) ──────
+        page = get_page(page_id)
+        current_html    = page.get("html_content", "")
+        html_summary    = page.get("html_summary", "")
+        component_map   = page.get("component_map", [])
+        persisted_model = page.get("coding_model_id")
+        page_title      = page.get("title", "")
+
+        edit_history = get_edit_history(page_id, limit=5)
+        chat_history = get_chat_history(page_id, limit=10)
+
         # ── intent classification (Llama-3.3-70B) ────────────────────────────
-        intent = _classify_intent(user_prompt)
-        tokens_used += 15  # flat estimate for classification
+        # Pass chat_history so the classifier has conversational context.
+        # e.g. "thanks!" after a build = conversational; same word in isolation
+        # could be ambiguous but context makes it clear.
+        intent = _classify_intent(user_prompt, chat_history)
+        tokens_used += 20  # flat estimate for classification
 
         if intent == "conversational":
             await _handle_conversational(
-                page_id, message_id, user_prompt, owner_id, tokens_used
+                page_id=page_id,
+                message_id=message_id,
+                user_prompt=user_prompt,
+                owner_id=owner_id,
+                tokens_used=tokens_used,
+                chat_history=chat_history,
+                page_title=page_title,
             )
             return
 
@@ -316,19 +391,9 @@ async def run_orchestrator(
         # ── build asset context ───────────────────────────────────────────────
         asset_context = build_asset_context(page_id)
 
-        # ── load page + history ───────────────────────────────────────────────
-        page = get_page(page_id)
-        current_html   = page.get("html_content", "")
-        html_summary   = page.get("html_summary", "")
-        component_map  = page.get("component_map", [])
-        persisted_model = page.get("coding_model_id")  # may be None on first run
-
-        edit_history = get_edit_history(page_id, limit=5)
-        chat_history = get_chat_history(page_id, limit=10)
-
         # ── lazily generate summary for imported pages ────────────────────────
-        is_new_page  = _is_boilerplate(current_html)
-        is_imported  = page.get("page_source") == "import" and not html_summary
+        is_new_page = _is_boilerplate(current_html)
+        is_imported = page.get("page_source") == "import" and not html_summary
 
         if not html_summary and not is_new_page:
             html_summary, summary_tokens = await _generate_summary_if_needed(
@@ -355,7 +420,8 @@ async def run_orchestrator(
             {
                 "role": "system",
                 "content": (
-                    "You are a planning assistant for an HTML coding agent. "
+                    "You are a planning assistant for Hyphertext — an AI-powered HTML page builder. "
+                    "ALL user requests are requests to build or modify an HTML page. "
                     "Analyse the user request and return a structured JSON plan."
                 ),
             },
@@ -464,14 +530,25 @@ async def run_orchestrator(
 
         if is_imported and not is_new_page:
             system_prompt += (
-                "\n\nIMPORTED PAGE NOTE: This page was imported by the user from existing code. "
+                "\n\n## IMPORTED PAGE NOTE\n"
+                "This page was imported by the user from existing code. "
                 "Preserve the existing layout, structure, and design unless explicitly told to change it. "
                 "Make only the specific requested changes surgically."
             )
 
+        # ── build the initial messages for the GLM coding loop ────────────────
+        # We provide a strong user-turn framing so GLM immediately understands
+        # the platform context and what tool to call.
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {
+                "role": "user",
+                "content": (
+                    f"Build or edit the HTML page for this request. "
+                    f"Call the appropriate tool immediately — do not write any prose.\n\n"
+                    f"REQUEST: {user_prompt}"
+                ),
+            },
         ]
 
         # ── agentic tool loop (GLM model) ─────────────────────────────────────
@@ -492,9 +569,64 @@ async def run_orchestrator(
             )
             tokens_used += response["input_tokens"] + response["output_tokens"]
 
+            # ── Safety net: if GLM responds with prose instead of a tool call ──
+            # This can happen when GLM misinterprets the task. We detect it and
+            # inject a strong correction message to force a tool call on the next
+            # iteration rather than silently returning a plain text response.
             if not response["tool_calls"]:
-                final_summary = response["content"] or "Changes applied."
-                break
+                content = (response["content"] or "").strip()
+
+                # If we've already made some changes, this might be a legitimate
+                # completion signal (GLM sometimes says "done" without calling finish)
+                if changes_log:
+                    # Treat as implicit finish
+                    final_summary = content if content else "Edits complete."
+                    snapshot_version(page_id, current_html)
+                    update_message_status(message_id, "completed")
+                    insert_assistant_message(page_id, final_summary)
+                    insert_edit_history(
+                        page_id=page_id,
+                        message_id=message_id,
+                        complexity=plan.get("complexity", "simple"),
+                        decision="surgical_edit",
+                        plan_json=plan,
+                        changes_json=changes_log,
+                        clarification_asked=clarification_asked,
+                        web_searches_used=web_searches_used,
+                        model_used=coding_model,
+                        tokens_used=tokens_used,
+                        success=True,
+                        owner_id=owner_id,
+                    )
+                    if owner_id:
+                        deduct_tokens(
+                            owner_id,
+                            tokens_used,
+                            f"AI edit: {final_summary[:80]}",
+                            message_id,
+                        )
+                    return
+
+                # No changes yet and no tool call — GLM wrote prose instead of coding.
+                # Inject a correction and retry.
+                if iteration < max_iterations:
+                    messages.append({
+                        "role": "assistant",
+                        "content": content,
+                    })
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "You must call a tool. Do not write prose responses. "
+                            "This is an HTML page builder — call write_full_file to build the page now. "
+                            "Do not explain anything. Just call the tool."
+                        ),
+                    })
+                    continue
+                else:
+                    # Exhausted retries — still no tool call
+                    final_summary = "I wasn't able to complete that. Please try rephrasing your request."
+                    break
 
             tool_results_for_messages = []
 
@@ -513,7 +645,22 @@ async def run_orchestrator(
                     if not html:
                         tool_results_for_messages.append({
                             "tool_call_id": tc_id,
-                            "result": "ERROR: html field is empty. You must provide complete HTML content.",
+                            "result": (
+                                "ERROR: html field is empty. You MUST provide the complete HTML content "
+                                "in the html parameter. Call write_full_file again with the full HTML."
+                            ),
+                        })
+                        continue
+
+                    # Sanity check: ensure it looks like valid HTML
+                    if "<!DOCTYPE" not in html and "<html" not in html:
+                        tool_results_for_messages.append({
+                            "tool_call_id": tc_id,
+                            "result": (
+                                "ERROR: html field does not contain a valid HTML document. "
+                                "It must start with <!DOCTYPE html> and include a full <html> structure. "
+                                "Call write_full_file again with the complete valid HTML document."
+                            ),
                         })
                         continue
 
@@ -573,7 +720,7 @@ async def run_orchestrator(
                         })
                         tool_results_for_messages.append({
                             "tool_call_id": tc_id,
-                            "result": "replaced successfully",
+                            "result": "Replaced successfully. Continue with the next change or call finish if done.",
                         })
                     else:
                         changes_log.append({
@@ -585,8 +732,9 @@ async def run_orchestrator(
                             "tool_call_id": tc_id,
                             "result": (
                                 "ERROR: old_str not found in the file. "
-                                "Check for exact whitespace and indentation match. "
-                                "Try a shorter, more unique substring."
+                                "The string must match EXACTLY including whitespace and indentation. "
+                                "Try a shorter, more unique substring. "
+                                "Check the current HTML in your context window carefully."
                             ),
                         })
 
@@ -687,7 +835,7 @@ async def run_orchestrator(
                     "content": result["result"],
                 })
 
-        # ── max iterations reached — still commit progress ────────────────────
+        # ── max iterations reached — commit whatever progress was made ────────
         snapshot_version(page_id, current_html)
         update_message_status(message_id, "completed")
         insert_assistant_message(page_id, final_summary)
