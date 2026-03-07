@@ -32,22 +32,12 @@ def update_page_summary_and_map(page_id: str, html_summary: str, component_map: 
 
 
 def update_page_coding_model(page_id: str, coding_model_id: str):
-    """
-    Persist the chosen coding model for this page so that all future edits
-    use the same model — ensuring the model that built the page also edits it.
-
-    Requires a `coding_model_id` column on the pages table (TEXT, nullable).
-    Run this migration once:
-        ALTER TABLE pages ADD COLUMN IF NOT EXISTS coding_model_id TEXT;
-    """
     try:
         supabase.table("pages").update({
             "coding_model_id": coding_model_id,
             "updated_at": "now()"
         }).eq("id", page_id).execute()
     except Exception as e:
-        # Non-fatal: if the column doesn't exist yet the orchestrator still
-        # works, just without model persistence across restarts.
         print(f"[DB] update_page_coding_model failed (column may not exist yet): {e}")
 
 
@@ -336,21 +326,78 @@ def insert_extracted_image_asset(
     return res.data[0]["id"] if res.data else None
 
 
-# ── Tokens ───────────────────────────────────────────────────────────────────
+# ── Billing: Dollar-credit system ────────────────────────────────────────────
+#
+# All AI usage is now billed in dollars based on per-model token pricing.
+# The model_pricing table stores input/output price per 1M tokens for each model.
+# deduct_dollar_credits RPC calculates cost, deducts from dollar_balance, and
+# records the transaction with full token breakdown.
+#
+# Legacy deduct_tokens is kept only for any remaining callers during transition.
 
-def deduct_tokens(user_id: str, amount: int, description: str, reference_id: str = None) -> dict:
-    res = supabase.rpc("deduct_tokens", {
-        "p_user_id": user_id,
-        "p_amount": amount,
-        "p_description": description,
-        "p_reference_id": reference_id
-    }).execute()
-    return res.data or {"success": False, "error": "RPC failed"}
+def deduct_dollar_credits(
+    user_id: str,
+    input_tokens: int,
+    output_tokens: int,
+    model_id: str,
+    description: str,
+    reference_id: str = None,
+) -> dict:
+    """
+    Deduct AI usage cost from the user's dollar_balance.
+
+    Pricing is looked up from the model_pricing table in Supabase.
+    If the model is not found (e.g. free/unknown), cost defaults to $0.
+
+    Returns the RPC result dict with keys:
+        success, dollar_cost, new_balance, input_tokens, output_tokens
+    """
+    try:
+        res = supabase.rpc("deduct_dollar_credits", {
+            "p_user_id": user_id,
+            "p_input_tokens": input_tokens,
+            "p_output_tokens": output_tokens,
+            "p_model_id": model_id,
+            "p_description": description,
+            "p_reference_id": reference_id,
+        }).execute()
+        return res.data or {"success": False, "error": "RPC returned no data"}
+    except Exception as e:
+        print(f"[DB] deduct_dollar_credits error: {e}")
+        return {"success": False, "error": str(e)}
 
 
 def check_token_balance(user_id: str) -> dict:
-    res = supabase.rpc("check_token_balance", {"p_user_id": user_id}).execute()
-    return res.data or {"has_balance": False, "balance": 0}
+    """
+    Returns has_balance (bool), balance (legacy tokens), dollar_balance (float).
+    has_balance is True when dollar_balance >= $0.001.
+    """
+    try:
+        res = supabase.rpc("check_token_balance", {"p_user_id": user_id}).execute()
+        return res.data or {"has_balance": False, "balance": 0, "dollar_balance": 0.0}
+    except Exception as e:
+        print(f"[DB] check_token_balance error: {e}")
+        return {"has_balance": False, "balance": 0, "dollar_balance": 0.0}
+
+
+# ── Legacy token deduction — kept for backward compat, prefer deduct_dollar_credits ──
+
+def deduct_tokens(user_id: str, amount: int, description: str, reference_id: str = None) -> dict:
+    """
+    Legacy flat-token deduction. Still functional but no longer called by the
+    orchestrator. Kept so any in-flight code or webhooks don't break.
+    """
+    try:
+        res = supabase.rpc("deduct_tokens", {
+            "p_user_id": user_id,
+            "p_amount": amount,
+            "p_description": description,
+            "p_reference_id": reference_id
+        }).execute()
+        return res.data or {"success": False, "error": "RPC failed"}
+    except Exception as e:
+        print(f"[DB] deduct_tokens error: {e}")
+        return {"success": False, "error": str(e)}
 
 
 # ── Subscriptions ────────────────────────────────────────────────────────────

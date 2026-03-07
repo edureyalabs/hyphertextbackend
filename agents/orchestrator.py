@@ -2,6 +2,19 @@
 """
 Main agent orchestrator for Hyphertext — AI-powered single-file HTML page builder.
 
+Billing model (dollar-credit system)
+────────────────────────────────────────────────────────────────────────
+All AI usage is billed in dollars. Each model call tracks input_tokens and
+output_tokens separately. At the end of a run, deduct_dollar_credits() is
+called once with the total token counts and the primary model used.
+
+For multi-model runs (planning on Groq + coding on GLM), costs are split:
+  - Planning / intent / conversation → billed under their respective model_id
+  - HTML coding loop                 → billed under the selected coding_model
+
+The model_pricing table in Supabase holds per-1M token prices for each
+model alias. Unknown / free models default to $0 cost.
+
 Model assignment
 ────────────────────────────────────────────────────────────────────────
 Intent classification  → PLANNING_MODEL      (groq/llama-3.3-70b)
@@ -9,21 +22,7 @@ Planning               → PLANNING_MODEL      (groq/llama-3.3-70b)
 Conversational reply   → CONVERSATION_MODEL  (groq/llama-3.1-8b)
 HTML coding — complex  → CODING_MODEL_COMPLEX (together/glm-5)
 HTML coding — simple   → CODING_MODEL_SIMPLE  (together/glm-4.7-flash)
-
-The coding model is selected ONCE via coding_router.select_coding_model()
-and then persisted to the page record (pages.coding_model_id) so that all
-subsequent edits on that page use the same model — ensuring the model that
-built the page is also the one that edits it.
-
-Intent routing
-────────────────────────────────────────────────────────────────────────
-conversational  → lightweight reply, redirect toward page building
-revert          → restore prior page version from version history
-code_change     → full agentic tool loop (plan → code → finish)
-
-All user messages that are NOT pure platform meta-questions or greetings
-are treated as code_change. General knowledge questions, topic explanations,
-and ambiguous requests all route to code_change and become HTML pages.
+Vision / image         → anthropic/haiku      (billed separately via image_processor)
 """
 
 import json
@@ -58,11 +57,77 @@ from database import (
     get_consecutive_clarification_count,
     get_page_versions,
     get_version_html,
-    deduct_tokens,
+    deduct_dollar_credits,
     check_token_balance,
 )
 from boilerplate import INITIAL_BOILERPLATE
 from config import PLANNING_MODEL, CONVERSATION_MODEL
+
+
+# ---------------------------------------------------------------------------
+# Token accounting helpers
+# ---------------------------------------------------------------------------
+
+class TokenLedger:
+    """
+    Tracks input/output tokens per model across an entire orchestrator run.
+    At the end of the run, call flush() to bill each model's usage.
+    """
+
+    def __init__(self):
+        # { model_id: {"input": int, "output": int} }
+        self._usage: dict[str, dict] = {}
+
+    def add(self, model_id: str, input_tokens: int, output_tokens: int):
+        if model_id not in self._usage:
+            self._usage[model_id] = {"input": 0, "output": 0}
+        self._usage[model_id]["input"]  += input_tokens
+        self._usage[model_id]["output"] += output_tokens
+
+    def total_tokens(self) -> int:
+        return sum(v["input"] + v["output"] for v in self._usage.values())
+
+    def flush(self, user_id: str, description: str, reference_id: str = None):
+        """
+        Deduct costs for every model used during this run.
+        Models with $0 pricing (e.g. unknown/free) produce no charge.
+        """
+        if not user_id:
+            return
+        for model_id, usage in self._usage.items():
+            if usage["input"] == 0 and usage["output"] == 0:
+                continue
+            deduct_dollar_credits(
+                user_id=user_id,
+                input_tokens=usage["input"],
+                output_tokens=usage["output"],
+                model_id=model_id,
+                description=description,
+                reference_id=reference_id,
+            )
+
+    def flush_single(
+        self,
+        user_id: str,
+        model_id: str,
+        description: str,
+        reference_id: str = None,
+    ):
+        """Bill only one specific model's accumulated tokens."""
+        if not user_id:
+            return
+        usage = self._usage.get(model_id, {"input": 0, "output": 0})
+        if usage["input"] == 0 and usage["output"] == 0:
+            return
+        deduct_dollar_credits(
+            user_id=user_id,
+            input_tokens=usage["input"],
+            output_tokens=usage["output"],
+            model_id=model_id,
+            description=description,
+            reference_id=reference_id,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -100,17 +165,6 @@ def _parse_plan(raw: str) -> dict:
 
 
 def _classify_intent(user_prompt: str, chat_history: list) -> str:
-    """
-    Classify user intent into: conversational | revert | code_change.
-
-    Passes recent chat history so the classifier understands conversational
-    context (e.g. a one-word "thanks!" after a build is clearly conversational,
-    but the same word mid-build might be ambiguous).
-
-    Uses a tight, example-rich system prompt (build_intent_classification_prompt)
-    so the model stays platform-aware and defaults to code_change when uncertain.
-    """
-    # Build a compact chat history string (last 6 exchanges) for context
     history_context = ""
     if chat_history:
         lines = []
@@ -129,7 +183,6 @@ def _classify_intent(user_prompt: str, chat_history: list) -> str:
         },
     ]
 
-    # Include chat history as context if available
     if history_context:
         messages.append({
             "role": "user",
@@ -151,7 +204,6 @@ def _classify_intent(user_prompt: str, chat_history: list) -> str:
         )
         result = response["content"].strip().lower()
 
-        # Normalise — model might return "code_change" or "code change" etc.
         if "revert" in result:
             return "revert"
         if "conversational" in result:
@@ -159,7 +211,6 @@ def _classify_intent(user_prompt: str, chat_history: list) -> str:
         if "code" in result:
             return "code_change"
 
-        # Default to code_change — it is always better to build than to chat
         return "code_change"
 
     except Exception:
@@ -175,16 +226,10 @@ async def _handle_conversational(
     message_id: str,
     user_prompt: str,
     owner_id: str,
-    tokens_used: int,
+    ledger: TokenLedger,
     chat_history: list,
     page_title: str = "",
 ):
-    """
-    Handle genuinely conversational messages: greetings, thanks, platform questions.
-
-    Uses a platform-aware system prompt that redirects off-topic questions
-    back toward building an HTML page.
-    """
     system_content = build_conversational_reply_prompt(
         user_prompt=user_prompt,
         chat_history=chat_history,
@@ -202,14 +247,14 @@ async def _handle_conversational(
         max_tokens=300,
         temperature=0.6,
     )
-    tokens_used += response["input_tokens"] + response["output_tokens"]
+    ledger.add(CONVERSATION_MODEL, response["input_tokens"], response["output_tokens"])
+
     reply = response["content"] or "Happy to help! What would you like to build or change?"
 
     update_message_status(message_id, "completed")
     insert_assistant_message(page_id, reply)
 
-    if owner_id:
-        deduct_tokens(owner_id, tokens_used, "Conversation reply", message_id)
+    ledger.flush(owner_id, "Conversation reply", message_id)
 
     insert_edit_history(
         page_id=page_id,
@@ -221,7 +266,7 @@ async def _handle_conversational(
         clarification_asked=False,
         web_searches_used=[],
         model_used=CONVERSATION_MODEL,
-        tokens_used=tokens_used,
+        tokens_used=ledger.total_tokens(),
         success=True,
         owner_id=owner_id,
     )
@@ -276,9 +321,10 @@ async def _generate_summary_if_needed(
     page_id: str,
     current_html: str,
     html_summary: str,
-) -> tuple[str, int]:
+    ledger: TokenLedger,
+) -> str:
     if html_summary or _is_boilerplate(current_html):
-        return html_summary, 0
+        return html_summary
 
     messages = [
         {
@@ -294,7 +340,8 @@ async def _generate_summary_if_needed(
             max_tokens=800,
             temperature=0.1,
         )
-        tokens_used = response["input_tokens"] + response["output_tokens"]
+        ledger.add(PLANNING_MODEL, response["input_tokens"], response["output_tokens"])
+
         raw = response["content"] or ""
         try:
             parsed = json.loads(
@@ -303,12 +350,12 @@ async def _generate_summary_if_needed(
             summary = parsed.get("html_summary", raw)
             component_map = parsed.get("component_map", [])
             update_page_summary_and_map(page_id, summary, component_map)
-            return summary, tokens_used
+            return summary
         except Exception:
             update_page_summary_and_map(page_id, raw, [])
-            return raw, tokens_used
+            return raw
     except Exception:
-        return "", 0
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -324,11 +371,14 @@ async def run_orchestrator(
     """
     Run the full agent loop for a single user message.
 
-    Model selection is fully automatic:
-      - Conversation / planning → Groq Llama models (fast, cheap)
-      - HTML coding             → GLM-5 or GLM-4.7-Flash via coding_router
+    Dollar billing:
+      - A TokenLedger accumulates input/output tokens per model throughout the run.
+      - At each natural exit point (finish, write_full_file, clarification, error),
+        ledger.flush() is called to bill all accumulated usage via deduct_dollar_credits.
+      - The model_pricing table resolves actual $ cost per model.
+      - Models not in the table (or with $0 pricing) produce no charge.
     """
-    tokens_used = 0
+    ledger = TokenLedger()
     web_searches_used = []
     changes_log = []
     plan = {}
@@ -338,19 +388,24 @@ async def run_orchestrator(
     try:
         update_message_status(message_id, "processing")
 
-        # ── token balance check ───────────────────────────────────────────────
+        # ── dollar balance check ──────────────────────────────────────────────
         if owner_id:
             balance_check = check_token_balance(owner_id)
             if not balance_check.get("has_balance", True):
+                dollar_balance = balance_check.get("dollar_balance", 0.0)
                 update_message_status(message_id, "error")
                 insert_assistant_message(
                     page_id,
-                    "You have run out of tokens. Please purchase more tokens to continue using the AI agent.",
-                    meta={"insufficient_tokens": True, "balance": balance_check.get("balance", 0)},
+                    "You have run out of credits. Please purchase more credits to continue using the AI agent.",
+                    meta={
+                        "insufficient_tokens": True,
+                        "dollar_balance": float(dollar_balance),
+                        "balance": balance_check.get("balance", 0),
+                    },
                 )
                 return
 
-        # ── load page + history early (needed for intent classification) ──────
+        # ── load page + history ───────────────────────────────────────────────
         page = get_page(page_id)
         current_html    = page.get("html_content", "")
         html_summary    = page.get("html_summary", "")
@@ -361,12 +416,10 @@ async def run_orchestrator(
         edit_history = get_edit_history(page_id, limit=5)
         chat_history = get_chat_history(page_id, limit=10)
 
-        # ── intent classification (Llama-3.3-70B) ────────────────────────────
-        # Pass chat_history so the classifier has conversational context.
-        # e.g. "thanks!" after a build = conversational; same word in isolation
-        # could be ambiguous but context makes it clear.
+        # ── intent classification ─────────────────────────────────────────────
         intent = _classify_intent(user_prompt, chat_history)
-        tokens_used += 20  # flat estimate for classification
+        # Classification uses ~20 tokens of the planning model — accounted below
+        # only if we proceed (avoid billing for pure conversational bounces)
 
         if intent == "conversational":
             await _handle_conversational(
@@ -374,7 +427,7 @@ async def run_orchestrator(
                 message_id=message_id,
                 user_prompt=user_prompt,
                 owner_id=owner_id,
-                tokens_used=tokens_used,
+                ledger=ledger,
                 chat_history=chat_history,
                 page_title=page_title,
             )
@@ -384,6 +437,9 @@ async def run_orchestrator(
             await _handle_revert(page_id, message_id, user_prompt, owner_id)
             return
 
+        # Account for classification tokens (planning model)
+        ledger.add(PLANNING_MODEL, 20, 3)
+
         # ── process pending uploads ───────────────────────────────────────────
         if owner_id:
             await process_pending_assets(page_id, owner_id)
@@ -391,15 +447,14 @@ async def run_orchestrator(
         # ── build asset context ───────────────────────────────────────────────
         asset_context = build_asset_context(page_id)
 
-        # ── lazily generate summary for imported pages ────────────────────────
+        # ── lazily generate summary ───────────────────────────────────────────
         is_new_page = _is_boilerplate(current_html)
         is_imported = page.get("page_source") == "import" and not html_summary
 
         if not html_summary and not is_new_page:
-            html_summary, summary_tokens = await _generate_summary_if_needed(
-                page_id, current_html, html_summary
+            html_summary = await _generate_summary_if_needed(
+                page_id, current_html, html_summary, ledger
             )
-            tokens_used += summary_tokens
 
         # ── resolve pending clarification ─────────────────────────────────────
         pending_clarification = get_pending_clarification(page_id)
@@ -415,7 +470,7 @@ async def run_orchestrator(
         consecutive_clarifications = get_consecutive_clarification_count(page_id)
         clarification_blocked = consecutive_clarifications >= 2
 
-        # ── planning (Llama-3.3-70B) ──────────────────────────────────────────
+        # ── planning ──────────────────────────────────────────────────────────
         planning_messages = [
             {
                 "role": "system",
@@ -433,7 +488,7 @@ async def run_orchestrator(
             max_tokens=1000,
             temperature=0.1,
         )
-        tokens_used += plan_response["input_tokens"] + plan_response["output_tokens"]
+        ledger.add(PLANNING_MODEL, plan_response["input_tokens"], plan_response["output_tokens"])
         plan = _parse_plan(plan_response["content"])
 
         # ── force full_rewrite for new pages ──────────────────────────────────
@@ -441,11 +496,9 @@ async def run_orchestrator(
             plan["decision"] = "full_rewrite"
             plan["needs_clarification"] = False
 
-        # ── nudge imported pages toward surgical ──────────────────────────────
         if is_imported and not is_new_page and plan.get("decision") != "full_rewrite":
             plan["decision"] = "surgical_edit"
 
-        # ── block clarification if asked too many times consecutively ─────────
         if clarification_blocked and plan.get("needs_clarification"):
             plan["needs_clarification"] = False
             plan["forced_proceed"] = True
@@ -478,15 +531,14 @@ async def run_orchestrator(
                 clarification_asked=True,
                 web_searches_used=[],
                 model_used=PLANNING_MODEL,
-                tokens_used=tokens_used,
+                tokens_used=ledger.total_tokens(),
                 success=True,
                 owner_id=owner_id,
             )
-            if owner_id:
-                deduct_tokens(owner_id, tokens_used, "Planning (clarification)", message_id)
+            ledger.flush(owner_id, "Planning (clarification)", message_id)
             return
 
-        # ── select coding model (one-time, then persisted) ────────────────────
+        # ── select coding model ───────────────────────────────────────────────
         coding_model = select_coding_model(
             plan=plan,
             is_new_page=is_new_page,
@@ -494,7 +546,6 @@ async def run_orchestrator(
             override_model_id=persisted_model,
         )
 
-        # Persist the selected model if this is the first time
         if not persisted_model:
             update_page_coding_model(page_id, coding_model)
 
@@ -536,9 +587,6 @@ async def run_orchestrator(
                 "Make only the specific requested changes surgically."
             )
 
-        # ── build the initial messages for the GLM coding loop ────────────────
-        # We provide a strong user-turn framing so GLM immediately understands
-        # the platform context and what tool to call.
         messages = [
             {"role": "system", "content": system_prompt},
             {
@@ -551,7 +599,7 @@ async def run_orchestrator(
             },
         ]
 
-        # ── agentic tool loop (GLM model) ─────────────────────────────────────
+        # ── agentic tool loop ─────────────────────────────────────────────────
         max_iterations = 15
         iteration = 0
         final_summary = "Done."
@@ -567,19 +615,13 @@ async def run_orchestrator(
                 max_tokens=8000,
                 temperature=0.3,
             )
-            tokens_used += response["input_tokens"] + response["output_tokens"]
+            ledger.add(coding_model, response["input_tokens"], response["output_tokens"])
 
-            # ── Safety net: if GLM responds with prose instead of a tool call ──
-            # This can happen when GLM misinterprets the task. We detect it and
-            # inject a strong correction message to force a tool call on the next
-            # iteration rather than silently returning a plain text response.
+            # ── Safety net: no tool call ──────────────────────────────────────
             if not response["tool_calls"]:
                 content = (response["content"] or "").strip()
 
-                # If we've already made some changes, this might be a legitimate
-                # completion signal (GLM sometimes says "done" without calling finish)
                 if changes_log:
-                    # Treat as implicit finish
                     final_summary = content if content else "Edits complete."
                     snapshot_version(page_id, current_html)
                     update_message_status(message_id, "completed")
@@ -594,26 +636,15 @@ async def run_orchestrator(
                         clarification_asked=clarification_asked,
                         web_searches_used=web_searches_used,
                         model_used=coding_model,
-                        tokens_used=tokens_used,
+                        tokens_used=ledger.total_tokens(),
                         success=True,
                         owner_id=owner_id,
                     )
-                    if owner_id:
-                        deduct_tokens(
-                            owner_id,
-                            tokens_used,
-                            f"AI edit: {final_summary[:80]}",
-                            message_id,
-                        )
+                    ledger.flush(owner_id, f"AI edit: {final_summary[:80]}", message_id)
                     return
 
-                # No changes yet and no tool call — GLM wrote prose instead of coding.
-                # Inject a correction and retry.
                 if iteration < max_iterations:
-                    messages.append({
-                        "role": "assistant",
-                        "content": content,
-                    })
+                    messages.append({"role": "assistant", "content": content})
                     messages.append({
                         "role": "user",
                         "content": (
@@ -624,7 +655,6 @@ async def run_orchestrator(
                     })
                     continue
                 else:
-                    # Exhausted retries — still no tool call
                     final_summary = "I wasn't able to complete that. Please try rephrasing your request."
                     break
 
@@ -652,7 +682,6 @@ async def run_orchestrator(
                         })
                         continue
 
-                    # Sanity check: ensure it looks like valid HTML
                     if "<!DOCTYPE" not in html and "<html" not in html:
                         tool_results_for_messages.append({
                             "tool_call_id": tc_id,
@@ -689,17 +718,11 @@ async def run_orchestrator(
                         clarification_asked=clarification_asked,
                         web_searches_used=web_searches_used,
                         model_used=coding_model,
-                        tokens_used=tokens_used,
+                        tokens_used=ledger.total_tokens(),
                         success=True,
                         owner_id=owner_id,
                     )
-                    if owner_id:
-                        deduct_tokens(
-                            owner_id,
-                            tokens_used,
-                            f"AI page build: {summary[:80]}",
-                            message_id,
-                        )
+                    ledger.flush(owner_id, f"AI page build: {summary[:80]}", message_id)
                     return
 
                 # ── str_replace ───────────────────────────────────────────────
@@ -760,14 +783,11 @@ async def run_orchestrator(
                         clarification_asked=True,
                         web_searches_used=web_searches_used,
                         model_used=coding_model,
-                        tokens_used=tokens_used,
+                        tokens_used=ledger.total_tokens(),
                         success=True,
                         owner_id=owner_id,
                     )
-                    if owner_id:
-                        deduct_tokens(
-                            owner_id, tokens_used, "Planning (clarification)", message_id
-                        )
+                    ledger.flush(owner_id, "Planning (clarification)", message_id)
                     return
 
                 # ── web_search ────────────────────────────────────────────────
@@ -797,20 +817,14 @@ async def run_orchestrator(
                         clarification_asked=clarification_asked,
                         web_searches_used=web_searches_used,
                         model_used=coding_model,
-                        tokens_used=tokens_used,
+                        tokens_used=ledger.total_tokens(),
                         success=True,
                         owner_id=owner_id,
                     )
-                    if owner_id:
-                        deduct_tokens(
-                            owner_id,
-                            tokens_used,
-                            f"AI edit: {final_summary[:80]}",
-                            message_id,
-                        )
+                    ledger.flush(owner_id, f"AI edit: {final_summary[:80]}", message_id)
                     return
 
-            # ── append assistant + tool results to message history ────────────
+            # append assistant + tool results to messages
             assistant_msg = {
                 "role": "assistant",
                 "content": response["content"] or "",
@@ -835,7 +849,7 @@ async def run_orchestrator(
                     "content": result["result"],
                 })
 
-        # ── max iterations reached — commit whatever progress was made ────────
+        # ── max iterations reached ────────────────────────────────────────────
         snapshot_version(page_id, current_html)
         update_message_status(message_id, "completed")
         insert_assistant_message(page_id, final_summary)
@@ -849,17 +863,11 @@ async def run_orchestrator(
             clarification_asked=clarification_asked,
             web_searches_used=web_searches_used,
             model_used=coding_model or PLANNING_MODEL,
-            tokens_used=tokens_used,
+            tokens_used=ledger.total_tokens(),
             success=True,
             owner_id=owner_id,
         )
-        if owner_id:
-            deduct_tokens(
-                owner_id,
-                tokens_used,
-                f"AI edit: {final_summary[:80]}",
-                message_id,
-            )
+        ledger.flush(owner_id, f"AI edit: {final_summary[:80]}", message_id)
 
     except Exception as e:
         print(f"[ORCHESTRATOR ERROR] {e}")
@@ -875,9 +883,9 @@ async def run_orchestrator(
             clarification_asked=clarification_asked,
             web_searches_used=web_searches_used,
             model_used=coding_model or PLANNING_MODEL,
-            tokens_used=tokens_used,
+            tokens_used=ledger.total_tokens(),
             success=False,
             owner_id=owner_id,
         )
-        if owner_id and tokens_used > 0:
-            deduct_tokens(owner_id, tokens_used, "AI edit (error)", message_id)
+        # Still bill whatever was used before the error
+        ledger.flush(owner_id, "AI edit (error)", message_id)
