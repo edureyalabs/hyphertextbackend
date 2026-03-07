@@ -12,7 +12,7 @@ from config import ANTHROPIC_API_KEY
 _client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # Models that support vision
-VISION_MODEL = "claude-haiku-4-5"
+VISION_MODEL = "claude-haiku-4-5-20251001"
 
 VISION_PROMPT = """Analyze this image carefully and return a JSON object with the following fields.
 Be concise but precise — this description will be given to an AI coding agent that will use the image in an HTML page.
