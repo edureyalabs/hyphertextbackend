@@ -2,61 +2,72 @@
 """
 Coding model router.
 
-Decides between GLM-5 (complex) and GLM-4.7-Flash (simple) for every
-HTML coding task based on signals from the planning step.
+Economy mode (default)
+──────────────────────────────────────────────────────────────────────
+Uses Together AI. Routing table:
+  is_new_page = True                         → CODING_MODEL_COMPLEX (GLM-5)
+  page_source = import                       → CODING_MODEL_COMPLEX (GLM-5)
+  plan.decision = full_rewrite               → CODING_MODEL_COMPLEX (GLM-5)
+  plan.complexity = complex / moderate       → CODING_MODEL_COMPLEX (GLM-5)
+  plan.complexity = simple + surgical_edit   → CODING_MODEL_SIMPLE  (GLM-4.7-Flash)
 
-Decision is made ONCE per page (on the first user message that triggers
-a code change) and then persisted to the page record so that all future
-edits on that page use the same model — ensuring the model that built
-the page is also the model that edits it.
+Speed mode
+──────────────────────────────────────────────────────────────────────
+Uses Cerebras for ALL coding tasks regardless of complexity or decision.
+  ALL tasks → CODING_MODEL_SPEED (cerebras/glm-4.7)
 
-Routing table
-─────────────────────────────────────────────────────────────────────────
-Signal                                          → Model
-─────────────────────────────────────────────────────────────────────────
-is_new_page = True   (vibe-coding a new page)  → GLM-5
-page_source = import (imported existing code)  → GLM-5
-plan.decision = full_rewrite                   → GLM-5
-plan.complexity = complex                       → GLM-5
-plan.complexity = moderate                      → GLM-5
-plan.complexity = simple + surgical_edit        → GLM-4.7-Flash
-─────────────────────────────────────────────────────────────────────────
+The inference_mode is chosen once on the first user message (persisted to
+the page record as `inference_mode`). All subsequent edits on the same page
+use the same mode — ensuring consistency between the model that built the
+page and the model that edits it.
 
-Once a model is persisted on the page, it is always returned for
-subsequent edits (the override_model_id path).
+The override_model_id path honours a previously persisted coding_model_id
+so the model choice stays stable across sessions.
 """
 
-from config import CODING_MODEL_COMPLEX, CODING_MODEL_SIMPLE
+from config import (
+    CODING_MODEL_COMPLEX,
+    CODING_MODEL_SIMPLE,
+    CODING_MODEL_SPEED,
+)
 
 
 def select_coding_model(
     plan: dict,
     is_new_page: bool,
     is_imported: bool,
+    inference_mode: str = "economy",
     override_model_id: str | None = None,
 ) -> str:
     """
-    Return the DeepInfra model alias to use for this coding task.
+    Return the model alias to use for this coding task.
 
     Args:
         plan:              Parsed plan dict from the planning step.
         is_new_page:       True if the page still contains the boilerplate placeholder.
         is_imported:       True if page_source == "import" and no summary exists yet.
+        inference_mode:    "economy" (Together AI) or "speed" (Cerebras).
         override_model_id: If the page already has a persisted model from a prior run,
                            pass it here to skip routing and stay consistent.
 
     Returns:
-        One of CODING_MODEL_COMPLEX or CODING_MODEL_SIMPLE.
+        One of CODING_MODEL_COMPLEX, CODING_MODEL_SIMPLE, or CODING_MODEL_SPEED.
     """
     # ── honour a previously persisted decision ────────────────────────────────
-    if override_model_id and override_model_id in (CODING_MODEL_COMPLEX, CODING_MODEL_SIMPLE):
+    valid_models = {CODING_MODEL_COMPLEX, CODING_MODEL_SIMPLE, CODING_MODEL_SPEED}
+    if override_model_id and override_model_id in valid_models:
         return override_model_id
 
-    # ── always use the heavy model for first-time / imported pages ────────────
+    # ── Speed mode: always use Cerebras regardless of complexity ─────────────
+    if inference_mode == "speed":
+        return CODING_MODEL_SPEED
+
+    # ── Economy mode routing (Together AI) ───────────────────────────────────
+
+    # Always use the heavy model for first-time / imported pages
     if is_new_page or is_imported:
         return CODING_MODEL_COMPLEX
 
-    # ── plan-based routing ────────────────────────────────────────────────────
     decision   = plan.get("decision", "surgical_edit")
     complexity = plan.get("complexity", "simple")
 

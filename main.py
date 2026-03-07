@@ -22,9 +22,14 @@ class AgentRunRequest(BaseModel):
     message_id: str
     page_id: str
     content: str
-    # model_id is accepted for backward compatibility with older frontend versions
-    # but is intentionally ignored — model selection is now fully automatic.
+    # model_id is accepted for backward compatibility but intentionally ignored —
+    # model selection is now fully automatic via coding_router.
     model_id: Optional[str] = None
+    # inference_mode is only honoured on the very first message for a page.
+    # "economy" → Together AI (default)
+    # "speed"   → Cerebras (~1000 TPS)
+    # On subsequent messages the persisted pages.inference_mode takes precedence.
+    inference_mode: Optional[str] = None
 
 
 @app.get("/")
@@ -41,12 +46,18 @@ async def agent_run(req: AgentRunRequest):
 
         owner_id = page.get("owner_id")
 
+        # Validate inference_mode value — default to "economy" for unknown values
+        inference_mode = req.inference_mode
+        if inference_mode not in ("economy", "speed"):
+            inference_mode = "economy"
+
         asyncio.create_task(
             run_orchestrator(
                 page_id=req.page_id,
                 message_id=req.message_id,
                 user_prompt=req.content,
                 owner_id=owner_id,
+                requested_inference_mode=inference_mode,
             )
         )
 

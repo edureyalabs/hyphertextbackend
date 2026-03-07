@@ -41,6 +41,20 @@ def update_page_coding_model(page_id: str, coding_model_id: str):
         print(f"[DB] update_page_coding_model failed (column may not exist yet): {e}")
 
 
+def update_page_inference_mode(page_id: str, mode: str):
+    """
+    Persist the inference mode ('economy' or 'speed') chosen by the user
+    on their first message. Called once; all subsequent edits read this value.
+    """
+    try:
+        supabase.table("pages").update({
+            "inference_mode": mode,
+            "updated_at": "now()"
+        }).eq("id", page_id).execute()
+    except Exception as e:
+        print(f"[DB] update_page_inference_mode failed (column may not exist yet): {e}")
+
+
 # ── Chat ─────────────────────────────────────────────────────────────────────
 
 def get_chat_history(page_id: str, limit: int = 10) -> list:
@@ -327,13 +341,6 @@ def insert_extracted_image_asset(
 
 
 # ── Billing: Dollar-credit system ────────────────────────────────────────────
-#
-# All AI usage is now billed in dollars based on per-model token pricing.
-# The model_pricing table stores input/output price per 1M tokens for each model.
-# deduct_dollar_credits RPC calculates cost, deducts from dollar_balance, and
-# records the transaction with full token breakdown.
-#
-# Legacy deduct_tokens is kept only for any remaining callers during transition.
 
 def deduct_dollar_credits(
     user_id: str,
@@ -343,15 +350,6 @@ def deduct_dollar_credits(
     description: str,
     reference_id: str = None,
 ) -> dict:
-    """
-    Deduct AI usage cost from the user's dollar_balance.
-
-    Pricing is looked up from the model_pricing table in Supabase.
-    If the model is not found (e.g. free/unknown), cost defaults to $0.
-
-    Returns the RPC result dict with keys:
-        success, dollar_cost, new_balance, input_tokens, output_tokens
-    """
     try:
         res = supabase.rpc("deduct_dollar_credits", {
             "p_user_id": user_id,
@@ -368,10 +366,6 @@ def deduct_dollar_credits(
 
 
 def check_token_balance(user_id: str) -> dict:
-    """
-    Returns has_balance (bool), balance (legacy tokens), dollar_balance (float).
-    has_balance is True when dollar_balance >= $0.001.
-    """
     try:
         res = supabase.rpc("check_token_balance", {"p_user_id": user_id}).execute()
         return res.data or {"has_balance": False, "balance": 0, "dollar_balance": 0.0}
@@ -380,13 +374,8 @@ def check_token_balance(user_id: str) -> dict:
         return {"has_balance": False, "balance": 0, "dollar_balance": 0.0}
 
 
-# ── Legacy token deduction — kept for backward compat, prefer deduct_dollar_credits ──
-
 def deduct_tokens(user_id: str, amount: int, description: str, reference_id: str = None) -> dict:
-    """
-    Legacy flat-token deduction. Still functional but no longer called by the
-    orchestrator. Kept so any in-flight code or webhooks don't break.
-    """
+    """Legacy flat-token deduction — kept for backward compat."""
     try:
         res = supabase.rpc("deduct_tokens", {
             "p_user_id": user_id,

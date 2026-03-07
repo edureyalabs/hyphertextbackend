@@ -2,27 +2,30 @@
 """
 Main agent orchestrator for Hyphertext — AI-powered single-file HTML page builder.
 
+Inference modes
+────────────────────────────────────────────────────────────────────────
+Economy (default)  → Together AI (GLM-5 for complex, GLM-4.7-Flash for simple)
+Speed              → Cerebras (GLM-4.7 for ALL coding tasks, ~1000 TPS)
+
+The mode is chosen by the user on their very first message via the frontend
+toggle. It is persisted to pages.inference_mode and pages.coding_model_id
+so all subsequent edits on that page use the same provider automatically.
+
 Billing model (dollar-credit system)
 ────────────────────────────────────────────────────────────────────────
 All AI usage is billed in dollars. Each model call tracks input_tokens and
 output_tokens separately. At the end of a run, deduct_dollar_credits() is
 called once with the total token counts and the primary model used.
 
-For multi-model runs (planning on Groq + coding on GLM), costs are split:
-  - Planning / intent / conversation → billed under their respective model_id
-  - HTML coding loop                 → billed under the selected coding_model
-
-The model_pricing table in Supabase holds per-1M token prices for each
-model alias. Unknown / free models default to $0 cost.
-
 Model assignment
 ────────────────────────────────────────────────────────────────────────
-Intent classification  → PLANNING_MODEL      (groq/llama-3.3-70b)
-Planning               → PLANNING_MODEL      (groq/llama-3.3-70b)
-Conversational reply   → CONVERSATION_MODEL  (groq/llama-3.1-8b)
-HTML coding — complex  → CODING_MODEL_COMPLEX (together/glm-5)
-HTML coding — simple   → CODING_MODEL_SIMPLE  (together/glm-4.7-flash)
-Vision / image         → anthropic/haiku      (billed separately via image_processor)
+Intent classification  → PLANNING_MODEL       (groq/llama-3.3-70b)
+Planning               → PLANNING_MODEL       (groq/llama-3.3-70b)
+Conversational reply   → CONVERSATION_MODEL   (groq/llama-3.1-8b)
+HTML coding — economy complex  → CODING_MODEL_COMPLEX (together/glm-5)
+HTML coding — economy simple   → CODING_MODEL_SIMPLE  (together/glm-4.7-flash)
+HTML coding — speed (all)      → CODING_MODEL_SPEED   (cerebras/glm-4.7)
+Vision / image         → anthropic/haiku (billed separately via image_processor)
 """
 
 import json
@@ -44,6 +47,7 @@ from database import (
     update_page_html,
     update_page_summary_and_map,
     update_page_coding_model,
+    update_page_inference_mode,
     get_chat_history,
     get_edit_history,
     update_message_status,
@@ -75,7 +79,6 @@ class TokenLedger:
     """
 
     def __init__(self):
-        # { model_id: {"input": int, "output": int} }
         self._usage: dict[str, dict] = {}
 
     def add(self, model_id: str, input_tokens: int, output_tokens: int):
@@ -88,10 +91,6 @@ class TokenLedger:
         return sum(v["input"] + v["output"] for v in self._usage.values())
 
     def flush(self, user_id: str, description: str, reference_id: str = None):
-        """
-        Deduct costs for every model used during this run.
-        Models with $0 pricing (e.g. unknown/free) produce no charge.
-        """
         if not user_id:
             return
         for model_id, usage in self._usage.items():
@@ -106,14 +105,7 @@ class TokenLedger:
                 reference_id=reference_id,
             )
 
-    def flush_single(
-        self,
-        user_id: str,
-        model_id: str,
-        description: str,
-        reference_id: str = None,
-    ):
-        """Bill only one specific model's accumulated tokens."""
+    def flush_single(self, user_id: str, model_id: str, description: str, reference_id: str = None):
         if not user_id:
             return
         usage = self._usage.get(model_id, {"input": 0, "output": 0})
@@ -367,16 +359,19 @@ async def run_orchestrator(
     message_id: str,
     user_prompt: str,
     owner_id: str = None,
+    requested_inference_mode: str = None,
 ):
     """
     Run the full agent loop for a single user message.
 
-    Dollar billing:
-      - A TokenLedger accumulates input/output tokens per model throughout the run.
-      - At each natural exit point (finish, write_full_file, clarification, error),
-        ledger.flush() is called to bill all accumulated usage via deduct_dollar_credits.
-      - The model_pricing table resolves actual $ cost per model.
-      - Models not in the table (or with $0 pricing) produce no charge.
+    Args:
+        page_id:                  The page being edited.
+        message_id:               The user's chat message ID.
+        user_prompt:              The user's text input.
+        owner_id:                 User ID for billing.
+        requested_inference_mode: "economy" or "speed" — only honoured on the
+                                  FIRST message (when pages.inference_mode is
+                                  not yet set). Ignored on all subsequent calls.
     """
     ledger = TokenLedger()
     web_searches_used = []
@@ -407,19 +402,29 @@ async def run_orchestrator(
 
         # ── load page + history ───────────────────────────────────────────────
         page = get_page(page_id)
-        current_html    = page.get("html_content", "")
-        html_summary    = page.get("html_summary", "")
-        component_map   = page.get("component_map", [])
-        persisted_model = page.get("coding_model_id")
-        page_title      = page.get("title", "")
+        current_html      = page.get("html_content", "")
+        html_summary      = page.get("html_summary", "")
+        component_map     = page.get("component_map", [])
+        persisted_model   = page.get("coding_model_id")
+        persisted_mode    = page.get("inference_mode")   # "economy" | "speed" | None
+        page_title        = page.get("title", "")
 
         edit_history = get_edit_history(page_id, limit=5)
         chat_history = get_chat_history(page_id, limit=10)
 
+        # ── resolve inference mode ────────────────────────────────────────────
+        # Priority: persisted DB value > request value > default "economy"
+        # Once set, the persisted value is always used — the request value is
+        # only honoured if the page has never had a mode set before.
+        if persisted_mode in ("economy", "speed"):
+            inference_mode = persisted_mode
+        elif requested_inference_mode in ("economy", "speed"):
+            inference_mode = requested_inference_mode
+        else:
+            inference_mode = "economy"
+
         # ── intent classification ─────────────────────────────────────────────
         intent = _classify_intent(user_prompt, chat_history)
-        # Classification uses ~20 tokens of the planning model — accounted below
-        # only if we proceed (avoid billing for pure conversational bounces)
 
         if intent == "conversational":
             await _handle_conversational(
@@ -543,13 +548,21 @@ async def run_orchestrator(
             plan=plan,
             is_new_page=is_new_page,
             is_imported=is_imported,
+            inference_mode=inference_mode,
             override_model_id=persisted_model,
         )
+
+        # ── persist mode + model on first run ─────────────────────────────────
+        if not persisted_mode:
+            update_page_inference_mode(page_id, inference_mode)
 
         if not persisted_model:
             update_page_coding_model(page_id, coding_model)
 
-        insert_thinking_message(page_id, {**plan, "_coding_model": coding_model})
+        insert_thinking_message(
+            page_id,
+            {**plan, "_coding_model": coding_model, "_inference_mode": inference_mode}
+        )
 
         # ── optional web search ───────────────────────────────────────────────
         if plan.get("needs_web_search") and plan.get("search_query"):
@@ -887,5 +900,4 @@ async def run_orchestrator(
             success=False,
             owner_id=owner_id,
         )
-        # Still bill whatever was used before the error
         ledger.flush(owner_id, "AI edit (error)", message_id)
