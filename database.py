@@ -1,3 +1,5 @@
+# database.py — added update_page_coding_model supports None to clear it
+
 from supabase import create_client, Client
 from config import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 from typing import Optional
@@ -31,20 +33,24 @@ def update_page_summary_and_map(page_id: str, html_summary: str, component_map: 
     }).eq("id", page_id).execute()
 
 
-def update_page_coding_model(page_id: str, coding_model_id: str):
+def update_page_coding_model(page_id: str, coding_model_id: Optional[str]):
+    """
+    Persist the coding model used for this page.
+    Pass None to clear it (e.g. when the user switches inference mode).
+    """
     try:
         supabase.table("pages").update({
             "coding_model_id": coding_model_id,
             "updated_at": "now()"
         }).eq("id", page_id).execute()
     except Exception as e:
-        print(f"[DB] update_page_coding_model failed (column may not exist yet): {e}")
+        print(f"[DB] update_page_coding_model failed: {e}")
 
 
 def update_page_inference_mode(page_id: str, mode: str):
     """
-    Persist the inference mode ('economy' or 'speed') chosen by the user
-    on their first message. Called once; all subsequent edits read this value.
+    Persist the inference mode ('economy' or 'speed').
+    Now called on every message if the mode has changed, not just the first.
     """
     try:
         supabase.table("pages").update({
@@ -52,7 +58,7 @@ def update_page_inference_mode(page_id: str, mode: str):
             "updated_at": "now()"
         }).eq("id", page_id).execute()
     except Exception as e:
-        print(f"[DB] update_page_inference_mode failed (column may not exist yet): {e}")
+        print(f"[DB] update_page_inference_mode failed: {e}")
 
 
 # ── Chat ─────────────────────────────────────────────────────────────────────
@@ -127,7 +133,6 @@ def snapshot_version(page_id: str, html: str, trigger_type: str = "agent_complet
         .execute()
     )
     next_version = (res.data[0]["version_num"] + 1) if res.data else 1
-
     supabase.table("page_versions").insert({
         "page_id": page_id,
         "html_snapshot": html,
@@ -340,7 +345,7 @@ def insert_extracted_image_asset(
     return res.data[0]["id"] if res.data else None
 
 
-# ── Billing: Dollar-credit system ────────────────────────────────────────────
+# ── Billing ───────────────────────────────────────────────────────────────────
 
 def deduct_dollar_credits(
     user_id: str,

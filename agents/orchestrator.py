@@ -7,29 +7,21 @@ Inference modes
 Economy (default)  → Together AI (GLM-5 for complex, GLM-4.7-Flash for simple)
 Speed              → Cerebras (GLM-4.7 for ALL coding tasks, ~1000 TPS)
 
-The mode is chosen by the user on their very first message via the frontend
-toggle. It is persisted to pages.inference_mode and pages.coding_model_id
-so all subsequent edits on that page use the same provider automatically.
+IMPORTANT: NO SILENT FALLBACKS.
+If the selected mode's model fails, the error is surfaced directly to the user
+with a clear message telling them to switch modes. We never silently fall back
+to the other provider — that would be dishonest about which model is running
+and could produce inconsistent results on pages built with a different model.
 
-IMPORTANT — mode is persisted BEFORE the first model call, not after.
-This ensures a page refresh always reflects the correct mode even if the
-coding step fails partway through.
+Mode is now MUTABLE — users can change it any time. When they do, the frontend
+calls PATCH /api/pages/:id with { inference_mode, reset_model: true } which
+clears coding_model_id so the next run re-routes from scratch.
 
 Billing model (dollar-credit system)
 ────────────────────────────────────────────────────────────────────────
 All AI usage is billed in dollars. Each model call tracks input_tokens and
 output_tokens separately. At the end of a run, deduct_dollar_credits() is
 called once with the total token counts and the primary model used.
-
-Model assignment
-────────────────────────────────────────────────────────────────────────
-Intent classification  → PLANNING_MODEL       (groq/llama-3.3-70b)
-Planning               → PLANNING_MODEL       (groq/llama-3.3-70b)
-Conversational reply   → CONVERSATION_MODEL   (groq/llama-3.1-8b)
-HTML coding — economy complex  → CODING_MODEL_COMPLEX (together/glm-5)
-HTML coding — economy simple   → CODING_MODEL_SIMPLE  (together/glm-4.7-flash)
-HTML coding — speed (all)      → CODING_MODEL_SPEED   (cerebras/glm-4.7)
-Vision / image         → anthropic/haiku (billed separately via image_processor)
 """
 
 import json
@@ -77,15 +69,61 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Model error types — used to give the user actionable messages
+# ---------------------------------------------------------------------------
+
+class ModelProviderError(Exception):
+    """
+    Raised when a specific model provider fails (e.g. Cerebras 503, Together 429).
+    Carries the inference_mode so the UI can show the right switch suggestion.
+    """
+    def __init__(self, message: str, inference_mode: str, provider: str):
+        super().__init__(message)
+        self.inference_mode = inference_mode
+        self.provider = provider
+
+    def user_facing_message(self) -> str:
+        if self.inference_mode == "speed":
+            return (
+                "⚡ Speed mode (Cerebras) is currently unavailable. "
+                "Please switch to Economy mode and try again."
+            )
+        else:
+            return (
+                "Economy mode (Together AI) is currently unavailable. "
+                "Please switch to Speed mode and try again."
+            )
+
+
+def _wrap_model_call(fn, inference_mode: str, provider: str):
+    """
+    Wraps a model router call. If it raises, converts to ModelProviderError
+    so the orchestrator can surface a clean message to the user.
+    """
+    try:
+        return fn()
+    except Exception as e:
+        err_str = str(e).lower()
+        # Detect provider-level failures (rate limits, outages, auth, bad params)
+        is_provider_error = any(x in err_str for x in [
+            "503", "502", "500", "429", "rate limit", "overloaded",
+            "connection", "timeout", "unavailable", "badrequest",
+            "400", "401", "403", "quota", "capacity"
+        ])
+        if is_provider_error:
+            raise ModelProviderError(str(e), inference_mode, provider) from e
+        raise  # re-raise unknown errors as-is
+
+
+def _provider_for_mode(inference_mode: str) -> str:
+    return "Cerebras" if inference_mode == "speed" else "Together AI"
+
+
+# ---------------------------------------------------------------------------
 # Token accounting helpers
 # ---------------------------------------------------------------------------
 
 class TokenLedger:
-    """
-    Tracks input/output tokens per model across an entire orchestrator run.
-    At the end of the run, call flush() to bill each model's usage.
-    """
-
     def __init__(self):
         self._usage: dict[str, dict] = {}
 
@@ -112,21 +150,6 @@ class TokenLedger:
                 description=description,
                 reference_id=reference_id,
             )
-
-    def flush_single(self, user_id: str, model_id: str, description: str, reference_id: str = None):
-        if not user_id:
-            return
-        usage = self._usage.get(model_id, {"input": 0, "output": 0})
-        if usage["input"] == 0 and usage["output"] == 0:
-            return
-        deduct_dollar_credits(
-            user_id=user_id,
-            input_tokens=usage["input"],
-            output_tokens=usage["output"],
-            model_id=model_id,
-            description=description,
-            reference_id=reference_id,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -203,16 +226,11 @@ def _classify_intent(user_prompt: str, chat_history: list) -> str:
             temperature=0.0,
         )
         result = response["content"].strip().lower()
-
         if "revert" in result:
             return "revert"
         if "conversational" in result:
             return "conversational"
-        if "code" in result:
-            return "code_change"
-
         return "code_change"
-
     except Exception:
         return "code_change"
 
@@ -250,12 +268,9 @@ async def _handle_conversational(
     ledger.add(CONVERSATION_MODEL, response["input_tokens"], response["output_tokens"])
 
     reply = response["content"] or "Happy to help! What would you like to build or change?"
-
     update_message_status(message_id, "completed")
     insert_assistant_message(page_id, reply)
-
     ledger.flush(owner_id, "Conversation reply", message_id)
-
     insert_edit_history(
         page_id=page_id,
         message_id=message_id,
@@ -288,9 +303,7 @@ async def _handle_revert(
     html = get_version_html(previous["id"])
     if not html:
         update_message_status(message_id, "completed")
-        insert_assistant_message(
-            page_id, "Could not retrieve the previous version. Please try again."
-        )
+        insert_assistant_message(page_id, "Could not retrieve the previous version. Please try again.")
         return
 
     update_page_html(page_id, html)
@@ -341,12 +354,9 @@ async def _generate_summary_if_needed(
             temperature=0.1,
         )
         ledger.add(PLANNING_MODEL, response["input_tokens"], response["output_tokens"])
-
         raw = response["content"] or ""
         try:
-            parsed = json.loads(
-                raw.strip().lstrip("```json").rstrip("```").strip()
-            )
+            parsed = json.loads(raw.strip().lstrip("```json").rstrip("```").strip())
             summary = parsed.get("html_summary", raw)
             component_map = parsed.get("component_map", [])
             update_page_summary_and_map(page_id, summary, component_map)
@@ -377,9 +387,10 @@ async def run_orchestrator(
         message_id:               The user's chat message ID.
         user_prompt:              The user's text input.
         owner_id:                 User ID for billing.
-        requested_inference_mode: "economy" or "speed" — only honoured on the
-                                  FIRST message (when pages.inference_mode is
-                                  not yet set). Ignored on all subsequent calls.
+        requested_inference_mode: "economy" or "speed" — honoured on every
+                                  message now (mode is mutable). If the page
+                                  has a persisted mode AND the request doesn't
+                                  supply one, the persisted mode wins.
     """
     ledger = TokenLedger()
     web_searches_used = []
@@ -387,6 +398,7 @@ async def run_orchestrator(
     plan = {}
     clarification_asked = False
     coding_model = None
+    inference_mode = "economy"
 
     try:
         update_message_status(message_id, "processing")
@@ -414,32 +426,35 @@ async def run_orchestrator(
         html_summary      = page.get("html_summary", "")
         component_map     = page.get("component_map", [])
         persisted_model   = page.get("coding_model_id")
-        persisted_mode    = page.get("inference_mode")   # "economy" | "speed" | None
+        persisted_mode    = page.get("inference_mode")
         page_title        = page.get("title", "")
 
         edit_history = get_edit_history(page_id, limit=5)
         chat_history = get_chat_history(page_id, limit=10)
 
         # ── resolve inference mode ────────────────────────────────────────────
-        # Priority: persisted DB value > request value > default "economy"
-        # Once set, the persisted value is always used — the request value is
-        # only honoured if the page has never had a mode set before.
-        if persisted_mode in ("economy", "speed"):
-            inference_mode = persisted_mode
-        elif requested_inference_mode in ("economy", "speed"):
+        # Priority: request value > persisted DB value > default "economy"
+        # The request value always wins now — mode is mutable.
+        # When the user switches modes, the frontend sends the new mode on the
+        # next message and we update the DB here.
+        if requested_inference_mode in ("economy", "speed"):
             inference_mode = requested_inference_mode
+        elif persisted_mode in ("economy", "speed"):
+            inference_mode = persisted_mode
         else:
             inference_mode = "economy"
 
-        # ── PERSIST MODE EARLY — before any model calls ───────────────────────
-        # This is the critical fix: we write inference_mode to the DB immediately
-        # so that a page refresh always shows the correct mode, even if the
-        # coding step fails halfway through.
-        if not persisted_mode:
+        # ── persist mode (update if changed) ─────────────────────────────────
+        if inference_mode != persisted_mode:
             update_page_inference_mode(page_id, inference_mode)
+            # When mode changes, clear the persisted coding_model_id so the
+            # router picks the right model for the new provider on this run.
+            if persisted_mode is not None:
+                update_page_coding_model(page_id, None)
+                persisted_model = None
             logger.info(
-                "[orchestrator] page=%s — inference_mode persisted early as '%s'",
-                page_id, inference_mode
+                "[orchestrator] page=%s — inference_mode changed from '%s' to '%s'",
+                page_id, persisted_mode, inference_mode
             )
 
         # ── intent classification ─────────────────────────────────────────────
@@ -461,7 +476,6 @@ async def run_orchestrator(
             await _handle_revert(page_id, message_id, user_prompt, owner_id)
             return
 
-        # Account for classification tokens (planning model)
         ledger.add(PLANNING_MODEL, 20, 3)
 
         # ── process pending uploads ───────────────────────────────────────────
@@ -515,7 +529,6 @@ async def run_orchestrator(
         ledger.add(PLANNING_MODEL, plan_response["input_tokens"], plan_response["output_tokens"])
         plan = _parse_plan(plan_response["content"])
 
-        # ── force full_rewrite for new pages ──────────────────────────────────
         if is_new_page:
             plan["decision"] = "full_rewrite"
             plan["needs_clarification"] = False
@@ -533,9 +546,7 @@ async def run_orchestrator(
             and not is_new_page
             and plan.get("confidence", 1.0) < 0.6
         ):
-            question = plan.get(
-                "clarification_question", "Could you clarify what you would like?"
-            )
+            question = plan.get("clarification_question", "Could you clarify what you would like?")
             insert_clarification(page_id, message_id, question)
             clarification_asked = True
             update_message_status(message_id, "completed")
@@ -576,8 +587,6 @@ async def run_orchestrator(
             page_id, coding_model, inference_mode
         )
 
-        # ── persist coding model on first run ─────────────────────────────────
-        # inference_mode was already persisted above. Persist coding_model_id now.
         if not persisted_model:
             update_page_coding_model(page_id, coding_model)
 
@@ -610,10 +619,8 @@ async def run_orchestrator(
 
         if asset_context:
             system_prompt += f"\n\n{asset_context}"
-
         if search_context:
             system_prompt += f"\n\n{search_context}"
-
         if is_imported and not is_new_page:
             system_prompt += (
                 "\n\n## IMPORTED PAGE NOTE\n"
@@ -635,6 +642,7 @@ async def run_orchestrator(
         ]
 
         # ── agentic tool loop ─────────────────────────────────────────────────
+        provider = _provider_for_mode(inference_mode)
         max_iterations = 15
         iteration = 0
         final_summary = "Done."
@@ -642,20 +650,23 @@ async def run_orchestrator(
         while iteration < max_iterations:
             iteration += 1
 
-            response = model_router.chat(
-                model_id=coding_model,
-                messages=messages,
-                tools=TOOL_DEFINITIONS,
-                tool_choice="auto",
-                max_tokens=8000,
-                temperature=0.3,
+            # ── HARD FAIL: no silent fallback ─────────────────────────────────
+            response = _wrap_model_call(
+                lambda: model_router.chat(
+                    model_id=coding_model,
+                    messages=messages,
+                    tools=TOOL_DEFINITIONS,
+                    tool_choice="auto",
+                    max_tokens=8000,
+                    temperature=0.3,
+                ),
+                inference_mode=inference_mode,
+                provider=provider,
             )
             ledger.add(coding_model, response["input_tokens"], response["output_tokens"])
 
-            # ── Safety net: no tool call ──────────────────────────────────────
             if not response["tool_calls"]:
                 content = (response["content"] or "").strip()
-
                 if changes_log:
                     final_summary = content if content else "Edits complete."
                     snapshot_version(page_id, current_html)
@@ -700,7 +711,6 @@ async def run_orchestrator(
                 args    = tool_call["arguments"]
                 tc_id   = tool_call["id"]
 
-                # ── write_full_file ───────────────────────────────────────────
                 if fn_name == "write_full_file":
                     html              = args.get("html", "")
                     summary           = args.get("summary", "Page created.")
@@ -732,13 +742,9 @@ async def run_orchestrator(
                     current_html = html
 
                     if new_html_summary:
-                        update_page_summary_and_map(
-                            page_id, new_html_summary, new_component_map
-                        )
+                        update_page_summary_and_map(page_id, new_html_summary, new_component_map)
 
-                    changes_log.append(
-                        {"tool": "write_full_file", "summary": summary, "success": True}
-                    )
+                    changes_log.append({"tool": "write_full_file", "summary": summary, "success": True})
                     final_summary = summary
                     snapshot_version(page_id, html)
                     update_message_status(message_id, "completed")
@@ -760,13 +766,10 @@ async def run_orchestrator(
                     ledger.flush(owner_id, f"AI page build: {summary[:80]}", message_id)
                     return
 
-                # ── str_replace ───────────────────────────────────────────────
                 elif fn_name == "str_replace":
                     old_str = args.get("old_str", "")
                     new_str = args.get("new_str", "")
-                    updated_html, success = execute_str_replace(
-                        current_html, old_str, new_str
-                    )
+                    updated_html, success = execute_str_replace(current_html, old_str, new_str)
 
                     if success:
                         current_html = updated_html
@@ -796,7 +799,6 @@ async def run_orchestrator(
                             ),
                         })
 
-                # ── ask_clarification ─────────────────────────────────────────
                 elif fn_name == "ask_clarification":
                     question = args.get("question", "Could you clarify?")
                     insert_clarification(page_id, message_id, question)
@@ -825,7 +827,6 @@ async def run_orchestrator(
                     ledger.flush(owner_id, "Planning (clarification)", message_id)
                     return
 
-                # ── web_search ────────────────────────────────────────────────
                 elif fn_name == "web_search":
                     query = args.get("query", "")
                     search_results = await brave_search(query)
@@ -836,7 +837,6 @@ async def run_orchestrator(
                         "result": formatted,
                     })
 
-                # ── finish ────────────────────────────────────────────────────
                 elif fn_name == "finish":
                     final_summary = args.get("summary", "Edits complete.")
                     snapshot_version(page_id, current_html)
@@ -859,7 +859,6 @@ async def run_orchestrator(
                     ledger.flush(owner_id, f"AI edit: {final_summary[:80]}", message_id)
                     return
 
-            # append assistant + tool results to messages
             assistant_msg = {
                 "role": "assistant",
                 "content": response["content"] or "",
@@ -904,10 +903,40 @@ async def run_orchestrator(
         )
         ledger.flush(owner_id, f"AI edit: {final_summary[:80]}", message_id)
 
+    except ModelProviderError as e:
+        # ── Hard fail: surface the provider error directly to the user ────────
+        logger.error(
+            "[orchestrator] ModelProviderError page=%s message=%s mode=%s provider=%s: %s",
+            page_id, message_id, e.inference_mode, e.provider, str(e)
+        )
+        update_message_status(message_id, "error")
+        insert_assistant_message(
+            page_id,
+            e.user_facing_message(),
+            meta={
+                "model_provider_error": True,
+                "inference_mode": e.inference_mode,
+                "provider": e.provider,
+            },
+        )
+        insert_edit_history(
+            page_id=page_id,
+            message_id=message_id,
+            complexity="unknown",
+            decision="unknown",
+            plan_json=plan,
+            changes_json=changes_log,
+            clarification_asked=clarification_asked,
+            web_searches_used=web_searches_used,
+            model_used=coding_model or PLANNING_MODEL,
+            tokens_used=ledger.total_tokens(),
+            success=False,
+            owner_id=owner_id,
+        )
+        # Don't bill for a failed provider call
+        # ledger.flush is intentionally skipped here for the coding model cost
+
     except Exception as e:
-        # Log the full stack trace — not just the message — so Cerebras errors
-        # (bad param, 400, auth) are visible in server logs instead of being
-        # swallowed silently and misattributed to Together AI fallback.
         logger.error(
             "[orchestrator] UNHANDLED ERROR page=%s message=%s\n%s",
             page_id, message_id, traceback.format_exc()
