@@ -11,6 +11,10 @@ The mode is chosen by the user on their very first message via the frontend
 toggle. It is persisted to pages.inference_mode and pages.coding_model_id
 so all subsequent edits on that page use the same provider automatically.
 
+IMPORTANT — mode is persisted BEFORE the first model call, not after.
+This ensures a page refresh always reflects the correct mode even if the
+coding step fails partway through.
+
 Billing model (dollar-credit system)
 ────────────────────────────────────────────────────────────────────────
 All AI usage is billed in dollars. Each model call tracks input_tokens and
@@ -29,6 +33,8 @@ Vision / image         → anthropic/haiku (billed separately via image_processo
 """
 
 import json
+import logging
+import traceback
 from agents.models import router as model_router
 from agents.models.coding_router import select_coding_model
 from agents.tools.html_tools import TOOL_DEFINITIONS, execute_str_replace
@@ -66,6 +72,8 @@ from database import (
 )
 from boilerplate import INITIAL_BOILERPLATE
 from config import PLANNING_MODEL, CONVERSATION_MODEL
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +431,17 @@ async def run_orchestrator(
         else:
             inference_mode = "economy"
 
+        # ── PERSIST MODE EARLY — before any model calls ───────────────────────
+        # This is the critical fix: we write inference_mode to the DB immediately
+        # so that a page refresh always shows the correct mode, even if the
+        # coding step fails halfway through.
+        if not persisted_mode:
+            update_page_inference_mode(page_id, inference_mode)
+            logger.info(
+                "[orchestrator] page=%s — inference_mode persisted early as '%s'",
+                page_id, inference_mode
+            )
+
         # ── intent classification ─────────────────────────────────────────────
         intent = _classify_intent(user_prompt, chat_history)
 
@@ -552,10 +571,13 @@ async def run_orchestrator(
             override_model_id=persisted_model,
         )
 
-        # ── persist mode + model on first run ─────────────────────────────────
-        if not persisted_mode:
-            update_page_inference_mode(page_id, inference_mode)
+        logger.info(
+            "[orchestrator] page=%s — routing to model='%s' (mode='%s')",
+            page_id, coding_model, inference_mode
+        )
 
+        # ── persist coding model on first run ─────────────────────────────────
+        # inference_mode was already persisted above. Persist coding_model_id now.
         if not persisted_model:
             update_page_coding_model(page_id, coding_model)
 
@@ -883,9 +905,18 @@ async def run_orchestrator(
         ledger.flush(owner_id, f"AI edit: {final_summary[:80]}", message_id)
 
     except Exception as e:
-        print(f"[ORCHESTRATOR ERROR] {e}")
+        # Log the full stack trace — not just the message — so Cerebras errors
+        # (bad param, 400, auth) are visible in server logs instead of being
+        # swallowed silently and misattributed to Together AI fallback.
+        logger.error(
+            "[orchestrator] UNHANDLED ERROR page=%s message=%s\n%s",
+            page_id, message_id, traceback.format_exc()
+        )
         update_message_status(message_id, "error")
-        insert_assistant_message(page_id, "Something went wrong. Please try again.")
+        insert_assistant_message(
+            page_id,
+            f"Something went wrong: {str(e)[:120]}. Please try again.",
+        )
         insert_edit_history(
             page_id=page_id,
             message_id=message_id,
