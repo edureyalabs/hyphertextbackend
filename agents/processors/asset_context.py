@@ -1,25 +1,25 @@
 # agents/processors/asset_context.py
 """
-Builds the asset context string that gets injected into the orchestrator system prompt.
-Called once per agent run, after all assets for the page have been processed.
+Builds the asset context string injected into the orchestrator system prompt.
+Now async — awaits get_page_assets_ready().
 """
 
 from database import get_page_assets_ready
 
 
-def build_asset_context(page_id: str) -> str:
+async def build_asset_context(page_id: str) -> str:
     """
     Returns a formatted string describing all ready assets for the page.
     Returns empty string if no assets exist.
     """
-    assets = get_page_assets_ready(page_id)
+    assets = await get_page_assets_ready(page_id)
     if not assets:
         return ""
 
     sections: list[str] = ["=" * 60, "UPLOADED FILES CONTEXT", "=" * 60]
 
-    images   = [a for a in assets if a["asset_type"] == "image"]
-    docs     = [a for a in assets if a["asset_type"] == "document"]
+    images    = [a for a in assets if a["asset_type"] == "image"]
+    docs      = [a for a in assets if a["asset_type"] == "document"]
     extracted = [a for a in assets if a["asset_type"] == "extracted_image"]
 
     # ── images ───────────────────────────────────────────────────────────────
@@ -49,7 +49,7 @@ def build_asset_context(page_id: str) -> str:
             if img.get("vision_contains_text") and img.get("vision_extracted_text"):
                 block.append(f"  Text in image: {img['vision_extracted_text']}")
             sections.append("\n".join(block))
-            sections.append("")  # blank line between entries
+            sections.append("")
 
     # ── documents ────────────────────────────────────────────────────────────
     if docs:
@@ -60,7 +60,6 @@ def build_asset_context(page_id: str) -> str:
             if doc.get("extracted_summary"):
                 block.append(f"  Content:\n{_indent(doc['extracted_summary'], 4)}")
             elif doc.get("extracted_text"):
-                # show first 600 chars if no summary
                 preview = doc["extracted_text"][:600]
                 if len(doc["extracted_text"]) > 600:
                     preview += "\n  [... truncated]"

@@ -507,7 +507,7 @@ async def _run_agent(
         await process_pending_assets(page_id, owner_id)
 
     # ── asset context ─────────────────────────────────────────────────────────
-    asset_context = build_asset_context(page_id)
+    asset_context = await build_asset_context(page_id)
 
     # ── lazy summary generation ───────────────────────────────────────────────
     is_new_page = _is_boilerplate(current_html)
