@@ -1,11 +1,26 @@
+# agents/models/groq_client.py
+"""
+Groq client — fully async using AsyncGroq.
+"""
+
 import json
-from groq import Groq
+import logging
+from groq import AsyncGroq
 from config import GROQ_API_KEY, GROQ_MODELS
 
-_client = Groq(api_key=GROQ_API_KEY)
+logger = logging.getLogger(__name__)
+
+_client = AsyncGroq(api_key=GROQ_API_KEY)
 
 
-def chat(model_id: str, messages: list, tools: list = None, tool_choice=None, max_tokens: int = 8000, temperature: float = 0.3) -> dict:
+async def chat(
+    model_id: str,
+    messages: list,
+    tools: list = None,
+    tool_choice=None,
+    max_tokens: int = 8000,
+    temperature: float = 0.3,
+) -> dict:
     model_name = GROQ_MODELS.get(model_id)
     if not model_name:
         raise ValueError(f"Unknown Groq model: {model_id}")
@@ -21,7 +36,7 @@ def chat(model_id: str, messages: list, tools: list = None, tool_choice=None, ma
     if tool_choice:
         kwargs["tool_choice"] = tool_choice
 
-    response = _client.chat.completions.create(**kwargs)
+    response = await _client.chat.completions.create(**kwargs)
     msg = response.choices[0].message
 
     tool_calls = None

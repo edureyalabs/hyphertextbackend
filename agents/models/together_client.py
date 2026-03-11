@@ -1,21 +1,19 @@
 # agents/models/together_client.py
 """
-Together AI client using the OpenAI-compatible API.
-Together AI exposes all models at https://api.together.xyz/v1
-with standard OpenAI message/tool schemas — identical interface to DeepInfra.
+Together AI client — fully async using AsyncOpenAI.
 """
 
 import json
-from openai import OpenAI
+from openai import AsyncOpenAI
 from config import TOGETHER_API_KEY, TOGETHER_BASE_URL, TOGETHER_MODELS
 
-_client = OpenAI(
+_client = AsyncOpenAI(
     api_key=TOGETHER_API_KEY,
     base_url=TOGETHER_BASE_URL,
 )
 
 
-def chat(
+async def chat(
     model_id: str,
     messages: list,
     tools: list = None,
@@ -23,20 +21,6 @@ def chat(
     max_tokens: int = 8000,
     temperature: float = 0.3,
 ) -> dict:
-    """
-    Send a chat request to Together AI.
-
-    Args:
-        model_id:    Internal alias like "together/glm-5"
-        messages:    OpenAI-format message list (system/user/assistant/tool)
-        tools:       OpenAI-format tool definitions (function schema)
-        tool_choice: "auto" | {"type": "function", "function": {"name": ...}}
-        max_tokens:  Maximum output tokens
-        temperature: Sampling temperature
-
-    Returns:
-        dict with keys: content, tool_calls, input_tokens, output_tokens
-    """
     model_name = TOGETHER_MODELS.get(model_id)
     if not model_name:
         raise ValueError(f"Unknown Together AI model: {model_id}")
@@ -56,7 +40,7 @@ def chat(
     elif isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
         kwargs["tool_choice"] = tool_choice
 
-    response = _client.chat.completions.create(**kwargs)
+    response = await _client.chat.completions.create(**kwargs)
     msg = response.choices[0].message
 
     content_text = msg.content or ""

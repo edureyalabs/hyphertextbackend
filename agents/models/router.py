@@ -1,19 +1,14 @@
 # agents/models/router.py
 """
-Model router — dispatches to the correct provider client.
-
-Providers currently in use:
-  groq/*          → agents/models/groq_client
-  cerebras/*      → agents/models/cerebras_client
-
-Together AI client is kept but not used in the active coding path.
+Model router — async dispatch to the correct provider client.
+All provider clients are now fully async — every call must be awaited.
 """
 
 from config import GROQ_MODELS, TOGETHER_MODELS, CEREBRAS_MODELS
 from agents.models import groq_client, together_client, cerebras_client
 
 
-def chat(
+async def chat(
     model_id: str,
     messages: list,
     tools: list = None,
@@ -28,16 +23,15 @@ def chat(
         dict: { content, tool_calls, input_tokens, output_tokens }
     """
     if model_id in GROQ_MODELS:
-        return groq_client.chat(
+        return await groq_client.chat(
             model_id, messages, tools, tool_choice, max_tokens, temperature
         )
     elif model_id in CEREBRAS_MODELS:
-        return cerebras_client.chat(
+        return await cerebras_client.chat(
             model_id, messages, tools, tool_choice, max_tokens, temperature
         )
     elif model_id in TOGETHER_MODELS:
-        # Kept for future use — not in active coding path
-        return together_client.chat(
+        return await together_client.chat(
             model_id, messages, tools, tool_choice, max_tokens, temperature
         )
     else:
