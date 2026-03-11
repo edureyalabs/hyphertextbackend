@@ -206,7 +206,7 @@ async def _upload_to_storage(path: str, data: bytes, content_type: str) -> Optio
             file=data,
             file_options={"content-type": content_type}
         )
-        public_url = db.storage.from_(SUPABASE_STORAGE_BUCKET).get_public_url(path)
+        public_url = await db.storage.from_(SUPABASE_STORAGE_BUCKET).get_public_url(path)
         return public_url
     except Exception as e:
         logger.warning("[ASSET PIPELINE] Storage upload error for %s: %s", path, e)
