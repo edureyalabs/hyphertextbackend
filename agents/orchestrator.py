@@ -2,33 +2,30 @@
 """
 Main agent orchestrator for Hyphertext — AI-powered single-file HTML page builder.
 
-Inference modes
+Coding model chain
 ────────────────────────────────────────────────────────────────────────
-Economy (default)  → Together AI (GLM-5 for complex, GLM-4.7-Flash for simple)
-Speed              → Cerebras (GLM-4.7 for ALL coding tasks, ~1000 TPS)
+Primary:  Cerebras GLM-4.7  — fast (~1000 TPS), tried up to 2 times
+Fallback: Groq GPT-OSS-120B — tried up to 2 times if Cerebras fails twice
 
-IMPORTANT: NO SILENT FALLBACKS.
-If the selected mode's model fails, the error is surfaced directly to the user
-with a clear message telling them to switch modes. We never silently fall back
-to the other provider — that would be dishonest about which model is running
-and could produce inconsistent results on pages built with a different model.
+If both providers exhaust their retries, the user gets a clean
+"something is wrong, please try again" message. No silent fallbacks,
+no misleading state.
 
-Mode is now MUTABLE — users can change it any time. When they do, the frontend
-calls PATCH /api/pages/:id with { inference_mode, reset_model: true } which
-clears coding_model_id so the next run re-routes from scratch.
+There is no longer a mode toggle. All pages use the same single coding chain.
+inference_mode column in DB is left as-is (not written, not read for routing).
+coding_model_id is still written so edit history stays consistent.
 
-Billing model (dollar-credit system)
+Intent classification fix
 ────────────────────────────────────────────────────────────────────────
-All AI usage is billed in dollars. Each model call tracks input_tokens and
-output_tokens separately. At the end of a run, deduct_dollar_credits() is
-called once with the total token counts and the primary model used.
+Chat history is now passed correctly to the intent classifier so that
+short follow-up messages ("yes", "ok", "make it darker") are classified
+as code_change rather than conversational.
 """
 
 import json
 import logging
 import traceback
 from agents.models import router as model_router
-from agents.models.coding_router import select_coding_model
 from agents.tools.html_tools import TOOL_DEFINITIONS, execute_str_replace
 from agents.tools.search_tools import brave_search, format_search_results
 from agents.knowledge.prompts import (
@@ -45,7 +42,6 @@ from database import (
     update_page_html,
     update_page_summary_and_map,
     update_page_coding_model,
-    update_page_inference_mode,
     get_chat_history,
     get_edit_history,
     update_message_status,
@@ -63,60 +59,113 @@ from database import (
     check_token_balance,
 )
 from boilerplate import INITIAL_BOILERPLATE
-from config import PLANNING_MODEL, CONVERSATION_MODEL
+from config import (
+    PLANNING_MODEL,
+    CONVERSATION_MODEL,
+    CODING_MODEL_PRIMARY,
+    CODING_MODEL_FALLBACK,
+)
 
 logger = logging.getLogger(__name__)
 
+# How many times to attempt each provider before moving to the next
+_MAX_RETRIES_PER_PROVIDER = 2
+
 
 # ---------------------------------------------------------------------------
-# Model error types — used to give the user actionable messages
+# Provider error detection
 # ---------------------------------------------------------------------------
 
-class ModelProviderError(Exception):
+def _is_provider_error(exc: Exception) -> bool:
+    """Returns True if the exception looks like a transient provider failure."""
+    err = str(exc).lower()
+    return any(x in err for x in [
+        "503", "502", "500", "429", "rate limit", "overloaded",
+        "connection", "timeout", "unavailable", "badrequest",
+        "400", "401", "403", "quota", "capacity", "bad request",
+    ])
+
+
+# ---------------------------------------------------------------------------
+# Coding model call with primary → fallback chain
+# ---------------------------------------------------------------------------
+
+def _call_coding_model(
+    messages: list,
+    tools: list,
+    tool_choice,
+    max_tokens: int,
+    temperature: float,
+) -> tuple[dict, str]:
     """
-    Raised when a specific model provider fails (e.g. Cerebras 503, Together 429).
-    Carries the inference_mode so the UI can show the right switch suggestion.
+    Attempt CODING_MODEL_PRIMARY up to _MAX_RETRIES_PER_PROVIDER times.
+    If all attempts fail, attempt CODING_MODEL_FALLBACK up to _MAX_RETRIES_PER_PROVIDER times.
+    If all fallback attempts also fail, raise a CodingModelExhaustedError.
+
+    Returns:
+        (response_dict, model_id_that_succeeded)
     """
-    def __init__(self, message: str, inference_mode: str, provider: str):
+    last_exc = None
+
+    # ── Primary: Cerebras ─────────────────────────────────────────────────
+    for attempt in range(1, _MAX_RETRIES_PER_PROVIDER + 1):
+        try:
+            resp = model_router.chat(
+                model_id=CODING_MODEL_PRIMARY,
+                messages=messages,
+                tools=tools,
+                tool_choice=tool_choice,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            return resp, CODING_MODEL_PRIMARY
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "[orchestrator] Primary model %s failed (attempt %d/%d): %s",
+                CODING_MODEL_PRIMARY, attempt, _MAX_RETRIES_PER_PROVIDER, str(exc)[:200],
+            )
+
+    logger.warning(
+        "[orchestrator] Primary model exhausted after %d attempts. Switching to fallback %s.",
+        _MAX_RETRIES_PER_PROVIDER, CODING_MODEL_FALLBACK,
+    )
+
+    # ── Fallback: Groq GPT-OSS-120B ───────────────────────────────────────
+    for attempt in range(1, _MAX_RETRIES_PER_PROVIDER + 1):
+        try:
+            resp = model_router.chat(
+                model_id=CODING_MODEL_FALLBACK,
+                messages=messages,
+                tools=tools,
+                tool_choice=tool_choice,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            return resp, CODING_MODEL_FALLBACK
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "[orchestrator] Fallback model %s failed (attempt %d/%d): %s",
+                CODING_MODEL_FALLBACK, attempt, _MAX_RETRIES_PER_PROVIDER, str(exc)[:200],
+            )
+
+    raise CodingModelExhaustedError(
+        "Both primary and fallback models failed. Please try again.",
+        last_exc=last_exc,
+    )
+
+
+class CodingModelExhaustedError(Exception):
+    def __init__(self, message: str, last_exc: Exception = None):
         super().__init__(message)
-        self.inference_mode = inference_mode
-        self.provider = provider
+        self.last_exc = last_exc
 
     def user_facing_message(self) -> str:
-        if self.inference_mode == "speed":
-            return (
-                "⚡ Speed mode (Cerebras) is currently unavailable. "
-                "Please switch to Economy mode and try again."
-            )
-        else:
-            return (
-                "Economy mode (Together AI) is currently unavailable. "
-                "Please switch to Speed mode and try again."
-            )
-
-
-def _wrap_model_call(fn, inference_mode: str, provider: str):
-    """
-    Wraps a model router call. If it raises, converts to ModelProviderError
-    so the orchestrator can surface a clean message to the user.
-    """
-    try:
-        return fn()
-    except Exception as e:
-        err_str = str(e).lower()
-        # Detect provider-level failures (rate limits, outages, auth, bad params)
-        is_provider_error = any(x in err_str for x in [
-            "503", "502", "500", "429", "rate limit", "overloaded",
-            "connection", "timeout", "unavailable", "badrequest",
-            "400", "401", "403", "quota", "capacity"
-        ])
-        if is_provider_error:
-            raise ModelProviderError(str(e), inference_mode, provider) from e
-        raise  # re-raise unknown errors as-is
-
-
-def _provider_for_mode(inference_mode: str) -> str:
-    return "Cerebras" if inference_mode == "speed" else "Together AI"
+        return (
+            "Something went wrong with our AI models right now. "
+            "Please wait a moment and try again."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -188,17 +237,13 @@ def _parse_plan(raw: str) -> dict:
 
 
 def _classify_intent(user_prompt: str, chat_history: list) -> str:
-    history_context = ""
-    if chat_history:
-        lines = []
-        for msg in chat_history[-6:]:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            if len(content) > 150:
-                content = content[:150] + "..."
-            lines.append(f"{role.upper()}: {content}")
-        history_context = "\n".join(lines)
+    """
+    Classify the user's message into: conversational | revert | code_change.
 
+    Chat history is passed as a dedicated context block BEFORE the new message
+    so the classifier can correctly handle short follow-ups like "yes", "ok",
+    "make it darker", "that one", etc.
+    """
     messages = [
         {
             "role": "system",
@@ -206,15 +251,33 @@ def _classify_intent(user_prompt: str, chat_history: list) -> str:
         },
     ]
 
-    if history_context:
-        messages.append({
-            "role": "user",
-            "content": (
-                f"RECENT CONVERSATION CONTEXT (for your reference only):\n"
-                f"{history_context}\n\n"
-                f"NOW CLASSIFY THIS NEW MESSAGE:\n{user_prompt}"
-            ),
-        })
+    # Build the user turn: history block + new message, always together
+    # so the model sees the full conversation context.
+    if chat_history:
+        history_lines = []
+        for msg in chat_history[-8:]:   # last 8 messages for routing context
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            msg_type = msg.get("message_type", "chat")
+            if len(content) > 200:
+                content = content[:200] + "..."
+            # Skip thinking messages — they're not useful for routing
+            if msg_type == "thinking":
+                continue
+            history_lines.append(f"{role.upper()}: {content}")
+
+        if history_lines:
+            history_block = "\n".join(history_lines)
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"CONVERSATION HISTORY (for context — use this to understand the new message):\n"
+                    f"{history_block}\n\n"
+                    f"NEW MESSAGE TO CLASSIFY:\n{user_prompt}"
+                ),
+            })
+        else:
+            messages.append({"role": "user", "content": user_prompt})
     else:
         messages.append({"role": "user", "content": user_prompt})
 
@@ -232,6 +295,7 @@ def _classify_intent(user_prompt: str, chat_history: list) -> str:
             return "conversational"
         return "code_change"
     except Exception:
+        # Safe default: always attempt a code change rather than silently drop
         return "code_change"
 
 
@@ -377,7 +441,7 @@ async def run_orchestrator(
     message_id: str,
     user_prompt: str,
     owner_id: str = None,
-    requested_inference_mode: str = None,
+    requested_inference_mode: str = None,   # accepted for API compat, not used for routing
 ):
     """
     Run the full agent loop for a single user message.
@@ -387,18 +451,16 @@ async def run_orchestrator(
         message_id:               The user's chat message ID.
         user_prompt:              The user's text input.
         owner_id:                 User ID for billing.
-        requested_inference_mode: "economy" or "speed" — honoured on every
-                                  message now (mode is mutable). If the page
-                                  has a persisted mode AND the request doesn't
-                                  supply one, the persisted mode wins.
+        requested_inference_mode: Accepted for backwards compatibility but
+                                  no longer used for model routing. The coding
+                                  chain is always: Cerebras → Groq fallback.
     """
     ledger = TokenLedger()
     web_searches_used = []
     changes_log = []
     plan = {}
     clarification_asked = False
-    coding_model = None
-    inference_mode = "economy"
+    coding_model = CODING_MODEL_PRIMARY  # default for logging; updated after first successful call
 
     try:
         update_message_status(message_id, "processing")
@@ -422,42 +484,16 @@ async def run_orchestrator(
 
         # ── load page + history ───────────────────────────────────────────────
         page = get_page(page_id)
-        current_html      = page.get("html_content", "")
-        html_summary      = page.get("html_summary", "")
-        component_map     = page.get("component_map", [])
-        persisted_model   = page.get("coding_model_id")
-        persisted_mode    = page.get("inference_mode")
-        page_title        = page.get("title", "")
+        current_html   = page.get("html_content", "")
+        html_summary   = page.get("html_summary", "")
+        component_map  = page.get("component_map", [])
+        persisted_model = page.get("coding_model_id")
+        page_title     = page.get("title", "")
 
         edit_history = get_edit_history(page_id, limit=5)
         chat_history = get_chat_history(page_id, limit=10)
 
-        # ── resolve inference mode ────────────────────────────────────────────
-        # Priority: request value > persisted DB value > default "economy"
-        # The request value always wins now — mode is mutable.
-        # When the user switches modes, the frontend sends the new mode on the
-        # next message and we update the DB here.
-        if requested_inference_mode in ("economy", "speed"):
-            inference_mode = requested_inference_mode
-        elif persisted_mode in ("economy", "speed"):
-            inference_mode = persisted_mode
-        else:
-            inference_mode = "economy"
-
-        # ── persist mode (update if changed) ─────────────────────────────────
-        if inference_mode != persisted_mode:
-            update_page_inference_mode(page_id, inference_mode)
-            # When mode changes, clear the persisted coding_model_id so the
-            # router picks the right model for the new provider on this run.
-            if persisted_mode is not None:
-                update_page_coding_model(page_id, None)
-                persisted_model = None
-            logger.info(
-                "[orchestrator] page=%s — inference_mode changed from '%s' to '%s'",
-                page_id, persisted_mode, inference_mode
-            )
-
-        # ── intent classification ─────────────────────────────────────────────
+        # ── intent classification (with full chat history for routing accuracy) ─
         intent = _classify_intent(user_prompt, chat_history)
 
         if intent == "conversational":
@@ -476,6 +512,7 @@ async def run_orchestrator(
             await _handle_revert(page_id, message_id, user_prompt, owner_id)
             return
 
+        # Small token accounting for the classification call
         ledger.add(PLANNING_MODEL, 20, 3)
 
         # ── process pending uploads ───────────────────────────────────────────
@@ -573,27 +610,14 @@ async def run_orchestrator(
             ledger.flush(owner_id, "Planning (clarification)", message_id)
             return
 
-        # ── select coding model ───────────────────────────────────────────────
-        coding_model = select_coding_model(
-            plan=plan,
-            is_new_page=is_new_page,
-            is_imported=is_imported,
-            inference_mode=inference_mode,
-            override_model_id=persisted_model,
-        )
-
-        logger.info(
-            "[orchestrator] page=%s — routing to model='%s' (mode='%s')",
-            page_id, coding_model, inference_mode
-        )
-
+        # ── persist coding model for edit history consistency ─────────────────
+        # We persist the primary model upfront. If fallback is used, we update
+        # after the first successful fallback call.
+        coding_model = CODING_MODEL_PRIMARY
         if not persisted_model:
             update_page_coding_model(page_id, coding_model)
 
-        insert_thinking_message(
-            page_id,
-            {**plan, "_coding_model": coding_model, "_inference_mode": inference_mode}
-        )
+        insert_thinking_message(page_id, {**plan, "_coding_model": coding_model})
 
         # ── optional web search ───────────────────────────────────────────────
         if plan.get("needs_web_search") and plan.get("search_query"):
@@ -642,7 +666,6 @@ async def run_orchestrator(
         ]
 
         # ── agentic tool loop ─────────────────────────────────────────────────
-        provider = _provider_for_mode(inference_mode)
         max_iterations = 15
         iteration = 0
         final_summary = "Done."
@@ -650,19 +673,42 @@ async def run_orchestrator(
         while iteration < max_iterations:
             iteration += 1
 
-            # ── HARD FAIL: no silent fallback ─────────────────────────────────
-            response = _wrap_model_call(
-                lambda: model_router.chat(
-                    model_id=coding_model,
+            # ── Call coding model with primary → fallback chain ───────────────
+            try:
+                response, used_model = _call_coding_model(
                     messages=messages,
                     tools=TOOL_DEFINITIONS,
                     tool_choice="auto",
                     max_tokens=8000,
                     temperature=0.3,
-                ),
-                inference_mode=inference_mode,
-                provider=provider,
-            )
+                )
+            except CodingModelExhaustedError as e:
+                # Both providers failed — surface clean message
+                logger.error(
+                    "[orchestrator] Coding model chain exhausted page=%s message=%s: %s",
+                    page_id, message_id, str(e)
+                )
+                update_message_status(message_id, "error")
+                insert_assistant_message(page_id, e.user_facing_message())
+                insert_edit_history(
+                    page_id=page_id,
+                    message_id=message_id,
+                    complexity=plan.get("complexity", "unknown"),
+                    decision=plan.get("decision", "unknown"),
+                    plan_json=plan,
+                    changes_json=changes_log,
+                    clarification_asked=clarification_asked,
+                    web_searches_used=web_searches_used,
+                    model_used=coding_model,
+                    tokens_used=ledger.total_tokens(),
+                    success=False,
+                    owner_id=owner_id,
+                )
+                ledger.flush(owner_id, "AI edit (model chain exhausted)", message_id)
+                return
+
+            # Track which model actually succeeded
+            coding_model = used_model
             ledger.add(coding_model, response["input_tokens"], response["output_tokens"])
 
             if not response["tool_calls"]:
@@ -896,45 +942,12 @@ async def run_orchestrator(
             changes_json=changes_log,
             clarification_asked=clarification_asked,
             web_searches_used=web_searches_used,
-            model_used=coding_model or PLANNING_MODEL,
+            model_used=coding_model,
             tokens_used=ledger.total_tokens(),
             success=True,
             owner_id=owner_id,
         )
         ledger.flush(owner_id, f"AI edit: {final_summary[:80]}", message_id)
-
-    except ModelProviderError as e:
-        # ── Hard fail: surface the provider error directly to the user ────────
-        logger.error(
-            "[orchestrator] ModelProviderError page=%s message=%s mode=%s provider=%s: %s",
-            page_id, message_id, e.inference_mode, e.provider, str(e)
-        )
-        update_message_status(message_id, "error")
-        insert_assistant_message(
-            page_id,
-            e.user_facing_message(),
-            meta={
-                "model_provider_error": True,
-                "inference_mode": e.inference_mode,
-                "provider": e.provider,
-            },
-        )
-        insert_edit_history(
-            page_id=page_id,
-            message_id=message_id,
-            complexity="unknown",
-            decision="unknown",
-            plan_json=plan,
-            changes_json=changes_log,
-            clarification_asked=clarification_asked,
-            web_searches_used=web_searches_used,
-            model_used=coding_model or PLANNING_MODEL,
-            tokens_used=ledger.total_tokens(),
-            success=False,
-            owner_id=owner_id,
-        )
-        # Don't bill for a failed provider call
-        # ledger.flush is intentionally skipped here for the coding model cost
 
     except Exception as e:
         logger.error(
@@ -955,7 +968,7 @@ async def run_orchestrator(
             changes_json=changes_log,
             clarification_asked=clarification_asked,
             web_searches_used=web_searches_used,
-            model_used=coding_model or PLANNING_MODEL,
+            model_used=coding_model,
             tokens_used=ledger.total_tokens(),
             success=False,
             owner_id=owner_id,

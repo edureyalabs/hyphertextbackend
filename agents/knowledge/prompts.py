@@ -219,14 +219,22 @@ Only respond with the JSON object. No markdown fences. No explanations.
 
 def build_intent_classification_prompt() -> str:
     """
-    Returns the system prompt for the intent classifier.
-    Tight, example-rich, platform-aware.
+    System prompt for the intent classifier.
+    Chat history is passed as a separate user message so the classifier
+    has full context before seeing the new message — this prevents
+    generalised/wrong routing on follow-up and short messages.
     """
     return """You are an intent classifier for Hyphertext — an AI-powered HTML page builder.
 
 Your job is to classify user messages into exactly one of three categories.
 
 PLATFORM CONTEXT: Every user of this platform is here to build, edit, or manage HTML pages. All requests — even ones that look like general questions — are almost always about building a page.
+
+CONVERSATION CONTEXT: You will be given recent chat history BEFORE the new message. Use this to understand follow-up messages correctly. For example:
+- If the last assistant message built a landing page and the user says "make it darker" → code_change (not conversational)
+- If the user says "yes" after a clarification question → code_change
+- If the user says "that looks good" after seeing a result → conversational
+- Short messages like "ok", "sure", "go ahead" in the context of an ongoing build → code_change
 
 CATEGORIES:
 
@@ -250,6 +258,7 @@ CATEGORIES:
    - General knowledge questions or topics (these get turned into HTML pages)
    - Requests for explanations, tutorials, or information (build a page about it)
    - Vague requests like "make it better", "do something cool"
+   - Short follow-up messages in the context of an active build ("yes", "ok", "go ahead", "sure", "that one")
    Examples:
    - "build a landing page for my startup"
    - "explain photosynthesis" → code_change (build a page about photosynthesis)
@@ -278,7 +287,7 @@ def build_conversational_reply_prompt(
     history_str = ""
     if chat_history:
         lines = []
-        for msg in chat_history[-6:]:  # last 6 messages for context
+        for msg in chat_history[-6:]:
             role = msg.get("role", "")
             content = msg.get("content", "")
             if len(content) > 200:

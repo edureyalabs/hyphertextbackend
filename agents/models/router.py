@@ -2,14 +2,11 @@
 """
 Model router — dispatches to the correct provider client.
 
-Providers:
+Providers currently in use:
   groq/*          → agents/models/groq_client
-  together/*      → agents/models/together_client
   cerebras/*      → agents/models/cerebras_client
 
-The orchestrator selects logical model aliases (CODING_MODEL_COMPLEX,
-CODING_MODEL_SIMPLE, CODING_MODEL_SPEED, PLANNING_MODEL, CONVERSATION_MODEL)
-from config.py. This router resolves those aliases to the right provider.
+Together AI client is kept but not used in the active coding path.
 """
 
 from config import GROQ_MODELS, TOGETHER_MODELS, CEREBRAS_MODELS
@@ -34,16 +31,17 @@ def chat(
         return groq_client.chat(
             model_id, messages, tools, tool_choice, max_tokens, temperature
         )
-    elif model_id in TOGETHER_MODELS:
-        return together_client.chat(
-            model_id, messages, tools, tool_choice, max_tokens, temperature
-        )
     elif model_id in CEREBRAS_MODELS:
         return cerebras_client.chat(
+            model_id, messages, tools, tool_choice, max_tokens, temperature
+        )
+    elif model_id in TOGETHER_MODELS:
+        # Kept for future use — not in active coding path
+        return together_client.chat(
             model_id, messages, tools, tool_choice, max_tokens, temperature
         )
     else:
         raise ValueError(
             f"Unknown model: {model_id!r}. "
-            f"Valid options: {list(GROQ_MODELS) + list(TOGETHER_MODELS) + list(CEREBRAS_MODELS)}"
+            f"Valid options: {list(GROQ_MODELS) + list(CEREBRAS_MODELS) + list(TOGETHER_MODELS)}"
         )

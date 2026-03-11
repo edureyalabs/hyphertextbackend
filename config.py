@@ -12,15 +12,14 @@ BRAVE_SEARCH_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY")
 SUPABASE_URL              = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
-# ── Groq: intent classification, planning, conversation ───────────────────────
+# ── Groq: intent classification, planning, conversation, coding fallback ──────
 GROQ_MODELS = {
-    "groq/llama-3.3-70b": "llama-3.3-70b-versatile",
-    "groq/llama-3.1-8b":  "llama-3.1-8b-instant",
+    "groq/llama-3.3-70b":    "llama-3.3-70b-versatile",
+    "groq/llama-3.1-8b":     "llama-3.1-8b-instant",
+    "groq/gpt-oss-120b":     "openai/gpt-oss-120b",
 }
 
-# ── Together AI: complex HTML coding tasks (Economy mode) ─────────────────────
-# GLM-5         → complex / full rewrites / new page builds / imported pages
-# GLM-4.7-Flash → surgical edits, simple fixes, single-component changes (Economy)
+# ── Together AI: kept for future use, not used for coding currently ───────────
 TOGETHER_MODELS = {
     "together/glm-5":         "zai-org/GLM-5",
     "together/glm-4.7-flash": "zai-org/GLM-4.7-Flash",
@@ -28,22 +27,22 @@ TOGETHER_MODELS = {
 
 TOGETHER_BASE_URL = "https://api.together.xyz/v1"
 
-# ── Cerebras: ultra-fast HTML coding (Speed mode) ─────────────────────────────
-# GLM-4.7 on Cerebras wafer-scale hardware — ~1,000-1,700 tokens/sec
-# Used for ALL coding tasks (both full rewrites and surgical edits) when
-# the user selects Speed mode. disable_reasoning=True keeps output clean.
+# ── Cerebras: primary coding model (~1000-1700 tokens/sec) ───────────────────
 CEREBRAS_MODELS = {
     "cerebras/glm-4.7": "zai-glm-4.7",
 }
 
 CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
 
-# ── Internal role aliases (never exposed to frontend) ────────────────────────
-CODING_MODEL_COMPLEX  = "together/glm-5"           # Economy: full rewrites, new pages, complex edits
-CODING_MODEL_SIMPLE   = "together/glm-4.7-flash"   # Economy: surgical edits, simple changes
-CODING_MODEL_SPEED    = "cerebras/glm-4.7"         # Speed: ALL coding tasks via Cerebras
-PLANNING_MODEL        = "groq/llama-3.3-70b"        # planning + intent classification
-CONVERSATION_MODEL    = "groq/llama-3.1-8b"         # lightweight chat replies
+# ── Coding model chain ────────────────────────────────────────────────────────
+# Primary:  Cerebras GLM-4.7  — fast, used for ALL coding tasks
+# Fallback: Groq GPT-OSS-120B — triggered after 2 consecutive Cerebras failures
+CODING_MODEL_PRIMARY  = "cerebras/glm-4.7"    # tried up to 2 times
+CODING_MODEL_FALLBACK = "groq/gpt-oss-120b"   # tried up to 2 times if primary fails
+
+# ── Internal role aliases ─────────────────────────────────────────────────────
+PLANNING_MODEL      = "groq/llama-3.3-70b"    # planning + intent classification
+CONVERSATION_MODEL  = "groq/llama-3.1-8b"     # lightweight chat replies
 
 ALL_MODELS = (
     list(GROQ_MODELS.keys())
