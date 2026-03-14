@@ -2,49 +2,15 @@
 """
 Main agent orchestrator — fully async, production-grade concurrency.
 
-Fixes applied:
-─────────────────────────────────────────────────────────────────────
-1. Chat history now passed to the planning step so follow-up messages
-   like "make it darker" are correctly understood as surgical edits.
+Agent status flow (written to pages.agent_status via set_agent_status):
+  "planning"         → after intent → code_change, before/during planning call
+  "searching"        → brave_search triggered
+  "processing files" → asset pipeline running
+  "writing"          → write_full_file tool called (new page / full rewrite)
+  "editing"          → str_replace tool called
+  None               → cleared on finish / error / conversational / revert
 
-2. Intent classifier retries once on exception instead of silently
-   defaulting to code_change with no context.
-
-3. Planning model retries up to 2 times on failure (was 0 retries).
-
-4. Summary generation retries up to 2 times on failure (was 0 retries).
-
-5. Conversational model retries up to 2 times on failure (was 0 retries).
-
-6. After write_full_file the html_summary is immediately generated from
-   the tool-call parameters so the NEXT edit always has page context.
-   Previously a missing/empty html_summary param caused the next edit
-   to have no context, often triggering an unnecessary full rewrite.
-
-7. str_replace success path now always calls finish implicitly if the
-   model never calls finish — prevents HTML being updated in DB but
-   the completed signal never reaching the frontend.
-
-8. Tool loop nudge message improved — gives the model explicit
-   instruction to call write_full_file with the current html in context
-   so it doesn't hallucinate an empty html param.
-
-9. Planning token counts are now read from actual API responses instead
-   of hardcoded flat estimates.
-
-10. Vision token billing moved to asset_pipeline — no change here but
-    noted for completeness.
-
-Concurrency model (unchanged)
-─────────────────────────────────────────────────────────────────────
-_AGENT_SEMAPHORE   : max 200 simultaneous agent runs per worker process.
-_CEREBRAS_SEMAPHORE: max 150 concurrent Cerebras calls per worker.
-_GROQ_SEMAPHORE    : max 100 concurrent Groq calls per worker.
-
-Coding model chain (unchanged)
-─────────────────────────────────────────────────────────────────────
-Primary:  Cerebras GLM-4.7  — tried up to 2 times
-Fallback: Groq GPT-OSS-120B — tried up to 2 times if Cerebras fails twice
+Logging: ~10 structured log lines per run, visible in Railway.
 """
 
 import asyncio
@@ -84,6 +50,7 @@ from database import (
     get_version_html,
     deduct_dollar_credits,
     check_token_balance,
+    set_agent_status,
 )
 from boilerplate import INITIAL_BOILERPLATE
 from config import (
@@ -99,15 +66,13 @@ logger = logging.getLogger(__name__)
 # Process-level semaphores
 # ---------------------------------------------------------------------------
 
-_AGENT_SEMAPHORE    = asyncio.Semaphore(200)
-_CEREBRAS_SEMAPHORE = asyncio.Semaphore(150)
-_GROQ_SEMAPHORE     = asyncio.Semaphore(100)
+_AGENT_SEMAPHORE     = asyncio.Semaphore(200)
+_CEREBRAS_SEMAPHORE  = asyncio.Semaphore(150)
+_GROQ_SEMAPHORE      = asyncio.Semaphore(100)
 
 _AGENT_TIMEOUT_SECONDS    = 300
 _MAX_RETRIES_PER_PROVIDER = 2
-
-# Retries for planning/classification/conversation calls (these have no fallback chain)
-_MAX_PLANNING_RETRIES = 2
+_MAX_PLANNING_RETRIES     = 2
 
 
 # ---------------------------------------------------------------------------
@@ -125,10 +90,6 @@ async def _call_cerebras(model_id: str, **kwargs) -> dict:
 
 
 async def _call_planning_model(**kwargs) -> dict:
-    """
-    Planning/classification calls go to Groq with up to _MAX_PLANNING_RETRIES retries.
-    Raises the last exception if all attempts fail.
-    """
     last_exc = None
     for attempt in range(1, _MAX_PLANNING_RETRIES + 1):
         try:
@@ -141,15 +102,11 @@ async def _call_planning_model(**kwargs) -> dict:
                 attempt, _MAX_PLANNING_RETRIES, str(exc)[:200],
             )
             if attempt < _MAX_PLANNING_RETRIES:
-                await asyncio.sleep(0.5 * attempt)  # brief back-off before retry
+                await asyncio.sleep(0.5 * attempt)
     raise last_exc
 
 
 async def _call_conversation_model(**kwargs) -> dict:
-    """
-    Conversation replies go to Groq with up to _MAX_PLANNING_RETRIES retries.
-    Raises the last exception if all attempts fail.
-    """
     last_exc = None
     for attempt in range(1, _MAX_PLANNING_RETRIES + 1):
         try:
@@ -189,13 +146,6 @@ async def _call_coding_model(
     max_tokens: int,
     temperature: float,
 ) -> tuple[dict, str]:
-    """
-    Attempt CODING_MODEL_PRIMARY up to _MAX_RETRIES_PER_PROVIDER times.
-    On total failure, attempt CODING_MODEL_FALLBACK up to _MAX_RETRIES_PER_PROVIDER times.
-    Raises CodingModelExhaustedError if both chains are exhausted.
-
-    Returns: (response_dict, model_id_that_succeeded)
-    """
     last_exc = None
     call_kwargs = dict(
         messages=messages,
@@ -213,13 +163,11 @@ async def _call_coding_model(
         except Exception as exc:
             last_exc = exc
             logger.warning(
-                "[orchestrator] Primary %s failed (attempt %d/%d): %s",
+                "[orchestrator] Primary %s attempt %d/%d failed: %s",
                 CODING_MODEL_PRIMARY, attempt, _MAX_RETRIES_PER_PROVIDER, str(exc)[:200],
             )
 
-    logger.warning(
-        "[orchestrator] Primary exhausted. Switching to fallback %s.", CODING_MODEL_FALLBACK
-    )
+    logger.warning("[orchestrator] Primary exhausted — switching to fallback %s", CODING_MODEL_FALLBACK)
 
     # ── Fallback: Groq ────────────────────────────────────────────────────────
     for attempt in range(1, _MAX_RETRIES_PER_PROVIDER + 1):
@@ -229,12 +177,12 @@ async def _call_coding_model(
         except Exception as exc:
             last_exc = exc
             logger.warning(
-                "[orchestrator] Fallback %s failed (attempt %d/%d): %s",
+                "[orchestrator] Fallback %s attempt %d/%d failed: %s",
                 CODING_MODEL_FALLBACK, attempt, _MAX_RETRIES_PER_PROVIDER, str(exc)[:200],
             )
 
     raise CodingModelExhaustedError(
-        "Both primary and fallback models failed. Please try again.",
+        "Both primary and fallback models failed.",
         last_exc=last_exc,
     )
 
@@ -354,9 +302,7 @@ async def _classify_intent(user_prompt: str, chat_history: list) -> str:
             return "conversational"
         return "code_change"
     except Exception:
-        # If classification fails after all retries, default to code_change
-        # (better to attempt a build than to drop the request)
-        logger.warning("[orchestrator] Intent classification failed after retries, defaulting to code_change")
+        logger.warning("[orchestrator] Intent classification failed after retries — defaulting to code_change")
         return "code_change"
 
 
@@ -490,7 +436,7 @@ async def _generate_summary_if_needed(
             await update_page_summary_and_map(page_id, raw, [])
             return raw
     except Exception as exc:
-        logger.warning("[orchestrator] Summary generation failed after retries: %s", exc)
+        logger.warning("[orchestrator] Summary generation failed: %s", exc)
         return ""
 
 
@@ -512,6 +458,11 @@ async def _run_agent(
     clarification_asked = False
     coding_model = CODING_MODEL_PRIMARY
 
+    logger.info(
+        "[agent] START page=%s message=%s prompt_len=%d",
+        page_id, message_id, len(user_prompt),
+    )
+
     await update_message_status(message_id, "processing")
 
     # ── balance check ─────────────────────────────────────────────────────────
@@ -519,6 +470,7 @@ async def _run_agent(
         balance_check = await check_token_balance(owner_id)
         if not balance_check.get("has_balance", True):
             dollar_balance = balance_check.get("dollar_balance", 0.0)
+            logger.warning("[agent] Insufficient credits — owner=%s balance=%.4f", owner_id, dollar_balance)
             await update_message_status(message_id, "error")
             await insert_assistant_message(
                 page_id,
@@ -542,8 +494,14 @@ async def _run_agent(
     edit_history = await get_edit_history(page_id, limit=5)
     chat_history = await get_chat_history(page_id, limit=10)
 
+    logger.info(
+        "[agent] Page loaded — title=%r is_new=%s has_summary=%s",
+        page_title, _is_boilerplate(current_html), bool(html_summary),
+    )
+
     # ── intent classification ─────────────────────────────────────────────────
     intent = await _classify_intent(user_prompt, chat_history)
+    logger.info("[agent] Intent classified as: %s — page=%s", intent, page_id)
 
     if intent == "conversational":
         await _handle_conversational(
@@ -561,9 +519,17 @@ async def _run_agent(
         await _handle_revert(page_id, message_id, user_prompt, owner_id)
         return
 
+    # ── set status: planning ──────────────────────────────────────────────────
+    await set_agent_status(page_id, "planning")
+
     # ── process pending uploads ───────────────────────────────────────────────
     if owner_id:
-        await process_pending_assets(page_id, owner_id)
+        pending_assets = await _get_pending_asset_count(page_id)
+        if pending_assets > 0:
+            logger.info("[agent] Processing %d pending assets — page=%s", pending_assets, page_id)
+            await set_agent_status(page_id, "processing files")
+            await process_pending_assets(page_id, owner_id)
+            await set_agent_status(page_id, "planning")
 
     # ── asset context ─────────────────────────────────────────────────────────
     asset_context = await build_asset_context(page_id)
@@ -591,7 +557,8 @@ async def _run_agent(
     consecutive_clarifications = await get_consecutive_clarification_count(page_id)
     clarification_blocked = consecutive_clarifications >= 2
 
-    # ── planning — now receives chat_history for follow-up context ────────────
+    # ── planning ──────────────────────────────────────────────────────────────
+    logger.info("[agent] Running planner — page=%s", page_id)
     planning_messages = [
         {
             "role": "system",
@@ -611,8 +578,12 @@ async def _run_agent(
         )
         ledger.add(PLANNING_MODEL, plan_response["input_tokens"], plan_response["output_tokens"])
         plan = _parse_plan(plan_response["content"])
+        logger.info(
+            "[agent] Plan received — decision=%s complexity=%s needs_search=%s — page=%s",
+            plan.get("decision"), plan.get("complexity"), plan.get("needs_web_search"), page_id,
+        )
     except Exception as exc:
-        logger.warning("[orchestrator] Planning failed after retries: %s — using defaults", exc)
+        logger.warning("[agent] Planning failed — using defaults: %s — page=%s", exc, page_id)
         plan = {
             "decision": "full_rewrite" if is_new_page else "surgical_edit",
             "complexity": "moderate",
@@ -645,6 +616,7 @@ async def _run_agent(
         question = plan.get("clarification_question", "Could you clarify what you would like?")
         await insert_clarification(page_id, message_id, question)
         clarification_asked = True
+        await set_agent_status(page_id, None)
         await update_message_status(message_id, "completed")
         await insert_assistant_message(
             page_id,
@@ -678,6 +650,8 @@ async def _run_agent(
 
     # ── optional web search ───────────────────────────────────────────────────
     if plan.get("needs_web_search") and plan.get("search_query"):
+        logger.info("[agent] Web search — query=%r page=%s", plan["search_query"], page_id)
+        await set_agent_status(page_id, "searching")
         search_results = await brave_search(plan["search_query"])
         web_searches_used.append(
             {"query": plan["search_query"], "results": search_results}
@@ -688,6 +662,14 @@ async def _run_agent(
         )
     else:
         search_context = ""
+
+    # ── determine initial writing status ─────────────────────────────────────
+    initial_code_status = "writing" if (is_new_page or plan.get("decision") == "full_rewrite") else "editing"
+    await set_agent_status(page_id, initial_code_status)
+    logger.info(
+        "[agent] Starting code generation — status=%s model=%s page=%s",
+        initial_code_status, coding_model, page_id,
+    )
 
     # ── build system prompt ───────────────────────────────────────────────────
     system_prompt = build_orchestrator_system_prompt(
@@ -729,6 +711,7 @@ async def _run_agent(
 
     while iteration < max_iterations:
         iteration += 1
+        logger.info("[agent] Tool loop iteration %d — page=%s", iteration, page_id)
 
         try:
             response, used_model = await _call_coding_model(
@@ -740,9 +723,10 @@ async def _run_agent(
             )
         except CodingModelExhaustedError as e:
             logger.error(
-                "[orchestrator] Coding model chain exhausted page=%s message=%s: %s",
-                page_id, message_id, str(e),
+                "[agent] Coding model chain EXHAUSTED — page=%s message=%s last_err=%s",
+                page_id, message_id, str(e.last_exc)[:200],
             )
+            await set_agent_status(page_id, None)
             await update_message_status(message_id, "error")
             await insert_assistant_message(page_id, e.user_facing_message())
             await insert_edit_history(
@@ -765,14 +749,19 @@ async def _run_agent(
         coding_model = used_model
         ledger.add(coding_model, response["input_tokens"], response["output_tokens"])
 
+        logger.info(
+            "[agent] Model response received — model=%s has_tool_calls=%s tokens_out=%d — page=%s",
+            coding_model, bool(response["tool_calls"]), response.get("output_tokens", 0), page_id,
+        )
+
         # ── model returned text with no tool call ─────────────────────────────
         if not response["tool_calls"]:
             content = (response["content"] or "").strip()
 
-            # If we already made changes, treat text response as implicit finish
             if changes_log:
                 final_summary = content if content else "Edits complete."
                 await snapshot_version(page_id, current_html)
+                await set_agent_status(page_id, None)
                 await update_message_status(message_id, "completed")
                 await insert_assistant_message(page_id, final_summary)
                 await insert_edit_history(
@@ -790,9 +779,9 @@ async def _run_agent(
                     owner_id=owner_id,
                 )
                 await ledger.flush(owner_id, f"AI edit: {final_summary[:80]}", message_id)
+                logger.info("[agent] DONE (implicit finish after changes) — page=%s", page_id)
                 return
 
-            # No changes yet and no tool call — nudge with richer context
             if iteration < max_iterations:
                 messages.append({"role": "assistant", "content": content})
                 messages.append({
@@ -808,7 +797,6 @@ async def _run_agent(
                 })
                 continue
             else:
-                # Max iterations reached with no changes — report failure
                 final_summary = "I wasn't able to complete that. Please try rephrasing your request."
                 break
 
@@ -820,12 +808,16 @@ async def _run_agent(
             args    = tool_call["arguments"]
             tc_id   = tool_call["id"]
 
+            logger.info("[agent] Tool call: %s — page=%s", fn_name, page_id)
+
             # ── write_full_file ───────────────────────────────────────────────
             if fn_name == "write_full_file":
                 html              = args.get("html", "")
                 summary           = args.get("summary", "Page created.")
                 new_html_summary  = args.get("html_summary", "")
                 new_component_map = args.get("component_map", [])
+
+                await set_agent_status(page_id, "writing")
 
                 if not html:
                     tool_results_for_messages.append({
@@ -852,12 +844,9 @@ async def _run_agent(
                 await update_page_html(page_id, html)
                 current_html = html
 
-                # Always persist html_summary — generate one from the HTML
-                # if the model didn't provide one, so the next edit has context.
                 if new_html_summary:
                     await update_page_summary_and_map(page_id, new_html_summary, new_component_map)
                 else:
-                    # Fire-and-forget summary generation — don't block the response
                     asyncio.create_task(
                         _generate_and_save_summary(page_id, html, ledger=None)
                     )
@@ -865,6 +854,7 @@ async def _run_agent(
                 changes_log.append({"tool": "write_full_file", "summary": summary, "success": True})
                 final_summary = summary
                 await snapshot_version(page_id, html)
+                await set_agent_status(page_id, None)
                 await update_message_status(message_id, "completed")
                 await insert_assistant_message(page_id, summary)
                 await insert_edit_history(
@@ -882,12 +872,18 @@ async def _run_agent(
                     owner_id=owner_id,
                 )
                 await ledger.flush(owner_id, f"AI page build: {summary[:80]}", message_id)
+                logger.info(
+                    "[agent] DONE write_full_file — summary=%r tokens=%d page=%s",
+                    summary[:60], ledger.total_tokens(), page_id,
+                )
                 return
 
             # ── str_replace ───────────────────────────────────────────────────
             elif fn_name == "str_replace":
                 old_str = args.get("old_str", "")
                 new_str = args.get("new_str", "")
+
+                await set_agent_status(page_id, "editing")
                 updated_html, success = execute_str_replace(current_html, old_str, new_str)
 
                 if success:
@@ -902,6 +898,7 @@ async def _run_agent(
                         "tool_call_id": tc_id,
                         "result": "Replaced successfully. Call finish if all edits are done, or call str_replace again for the next change.",
                     })
+                    logger.info("[agent] str_replace SUCCESS — page=%s", page_id)
                 else:
                     changes_log.append({
                         "tool": "str_replace",
@@ -917,12 +914,14 @@ async def _run_agent(
                             "Check the current HTML in your context window carefully."
                         ),
                     })
+                    logger.warning("[agent] str_replace FAILED — string not found — page=%s", page_id)
 
             # ── ask_clarification ─────────────────────────────────────────────
             elif fn_name == "ask_clarification":
                 question = args.get("question", "Could you clarify?")
                 await insert_clarification(page_id, message_id, question)
                 clarification_asked = True
+                await set_agent_status(page_id, None)
                 await update_message_status(message_id, "completed")
                 await insert_assistant_message(
                     page_id,
@@ -945,11 +944,14 @@ async def _run_agent(
                     owner_id=owner_id,
                 )
                 await ledger.flush(owner_id, "Planning (clarification)", message_id)
+                logger.info("[agent] Clarification asked — page=%s", page_id)
                 return
 
             # ── web_search ────────────────────────────────────────────────────
             elif fn_name == "web_search":
                 query = args.get("query", "")
+                logger.info("[agent] In-loop web search — query=%r page=%s", query, page_id)
+                await set_agent_status(page_id, "searching")
                 search_results = await brave_search(query)
                 web_searches_used.append({"query": query, "results": search_results})
                 formatted = format_search_results(search_results)
@@ -957,11 +959,14 @@ async def _run_agent(
                     "tool_call_id": tc_id,
                     "result": formatted,
                 })
+                # Return to writing/editing status after search
+                await set_agent_status(page_id, initial_code_status)
 
             # ── finish ────────────────────────────────────────────────────────
             elif fn_name == "finish":
                 final_summary = args.get("summary", "Edits complete.")
                 await snapshot_version(page_id, current_html)
+                await set_agent_status(page_id, None)
                 await update_message_status(message_id, "completed")
                 await insert_assistant_message(page_id, final_summary)
                 await insert_edit_history(
@@ -979,6 +984,10 @@ async def _run_agent(
                     owner_id=owner_id,
                 )
                 await ledger.flush(owner_id, f"AI edit: {final_summary[:80]}", message_id)
+                logger.info(
+                    "[agent] DONE finish — summary=%r tokens=%d page=%s",
+                    final_summary[:60], ledger.total_tokens(), page_id,
+                )
                 return
 
         # ── append assistant + tool results to message history ────────────────
@@ -1007,11 +1016,16 @@ async def _run_agent(
             })
 
     # ── max iterations reached ────────────────────────────────────────────────
-    # If we got here with changes made but no explicit finish, still complete cleanly.
     if changes_log:
         final_summary = "Done. All changes applied."
 
+    logger.info(
+        "[agent] Max iterations reached — changes_made=%d page=%s",
+        len(changes_log), page_id,
+    )
+
     await snapshot_version(page_id, current_html)
+    await set_agent_status(page_id, None)
     await update_message_status(message_id, "completed")
     await insert_assistant_message(page_id, final_summary)
     await insert_edit_history(
@@ -1032,15 +1046,24 @@ async def _run_agent(
 
 
 # ---------------------------------------------------------------------------
-# Fire-and-forget summary generation (for write_full_file without html_summary)
+# Pending asset count helper
+# ---------------------------------------------------------------------------
+
+async def _get_pending_asset_count(page_id: str) -> int:
+    """Returns count of pending assets without fetching all data."""
+    try:
+        from database import get_pending_assets_for_page
+        assets = await get_pending_assets_for_page(page_id)
+        return len(assets)
+    except Exception:
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Fire-and-forget summary generation
 # ---------------------------------------------------------------------------
 
 async def _generate_and_save_summary(page_id: str, html: str, ledger=None) -> None:
-    """
-    Generates and persists an html_summary + component_map for a newly written page.
-    Called as a background task — does not block the agent response.
-    A separate ledger is not used here since billing is best-effort for background work.
-    """
     messages = [
         {
             "role": "system",
@@ -1063,7 +1086,7 @@ async def _generate_and_save_summary(page_id: str, html: str, ledger=None) -> No
         except Exception:
             await update_page_summary_and_map(page_id, raw[:2000], [])
     except Exception as exc:
-        logger.warning("[orchestrator] Background summary generation failed for page %s: %s", page_id, exc)
+        logger.warning("[orchestrator] Background summary generation failed page=%s: %s", page_id, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1075,14 +1098,12 @@ async def run_orchestrator(
     message_id: str,
     user_prompt: str,
     owner_id: str = None,
-    requested_inference_mode: str = None,  # kept for API compat
+    requested_inference_mode: str = None,
 ):
     """
     Public entry point called from main.py via asyncio.create_task().
-
-    Wraps _run_agent with:
-    - _AGENT_SEMAPHORE : caps concurrent runs to prevent memory/rate-limit explosion
-    - asyncio.timeout  : kills stuck runs after 5 minutes, releasing the semaphore slot
+    Wraps _run_agent with semaphore + timeout guards.
+    Always clears agent_status on exit (success or error).
     """
     try:
         async with _AGENT_SEMAPHORE:
@@ -1099,6 +1120,7 @@ async def run_orchestrator(
             page_id, message_id, _AGENT_TIMEOUT_SECONDS,
         )
         try:
+            await set_agent_status(page_id, None)
             await update_message_status(message_id, "error")
             await insert_assistant_message(
                 page_id,
@@ -1113,6 +1135,7 @@ async def run_orchestrator(
             page_id, message_id, traceback.format_exc(),
         )
         try:
+            await set_agent_status(page_id, None)
             await update_message_status(message_id, "error")
             await insert_assistant_message(
                 page_id,

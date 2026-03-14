@@ -1,7 +1,4 @@
 # database.py — fully async using supabase AsyncClient
-# All public functions are async and await the Supabase client.
-# The async client is initialised once per process via get_db().
-
 import asyncio
 import logging
 from typing import Optional
@@ -11,16 +8,11 @@ from config import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Single async client per process — initialised lazily on first use.
-# ---------------------------------------------------------------------------
-
 _client: Optional[AsyncClient] = None
 _client_lock = asyncio.Lock()
 
 
 async def get_db() -> AsyncClient:
-    """Return (or create) the process-level async Supabase client."""
     global _client
     if _client is not None:
         return _client
@@ -30,8 +22,6 @@ async def get_db() -> AsyncClient:
     return _client
 
 
-# Kept for the handful of legacy sync call-sites that haven't been converted yet.
-# Do NOT use in new code.
 def get_supabase_client():
     from supabase import create_client
     return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
@@ -82,6 +72,23 @@ async def update_page_inference_mode(page_id: str, mode: str):
         }).eq("id", page_id).execute()
     except Exception as e:
         logger.warning("[DB] update_page_inference_mode failed: %s", e)
+
+
+async def set_agent_status(page_id: str, status: Optional[str]):
+    """
+    Write a human-readable agent status string to the pages row.
+    Pass None to clear the status (agent done or idle).
+    Silently swallows errors so it never crashes the agent loop.
+    """
+    try:
+        db = await get_db()
+        await db.table("pages").update({
+            "agent_status": status,
+            "agent_status_updated_at": "now()" if status else None,
+            "updated_at": "now()",
+        }).eq("id", page_id).execute()
+    except Exception as e:
+        logger.warning("[DB] set_agent_status failed page=%s status=%s: %s", page_id, status, e)
 
 
 # ── Chat ─────────────────────────────────────────────────────────────────────
@@ -435,7 +442,6 @@ async def deduct_tokens(
     description: str,
     reference_id: str = None,
 ) -> dict:
-    """Legacy flat-token deduction — kept for backward compat."""
     try:
         db = await get_db()
         res = await db.rpc("deduct_tokens", {

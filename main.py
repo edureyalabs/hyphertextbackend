@@ -1,6 +1,7 @@
 # main.py
 import asyncio
 import logging
+import sys
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,6 +11,22 @@ from typing import Optional
 from database import get_page
 from agents.orchestrator import run_orchestrator
 from boilerplate import INITIAL_BOILERPLATE
+
+# ---------------------------------------------------------------------------
+# Logging — structured, visible in Railway
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+# Quiet noisy libraries
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("supabase").setLevel(logging.WARNING)
+logging.getLogger("postgrest").setLevel(logging.WARNING)
+logging.getLogger("realtime").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
@@ -27,9 +44,13 @@ class AgentRunRequest(BaseModel):
     message_id: str
     page_id: str
     content: str
-    # Accepted for backward compatibility — model selection is automatic.
     model_id: Optional[str] = None
     inference_mode: Optional[str] = None
+
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("🚀 Hyphertext Agent Backend starting up")
 
 
 @app.get("/")
@@ -39,9 +60,14 @@ def health():
 
 @app.post("/agent/run")
 async def agent_run(req: AgentRunRequest):
+    logger.info(
+        "[API] /agent/run received — page=%s message=%s content_len=%d",
+        req.page_id, req.message_id, len(req.content),
+    )
     try:
         page = await get_page(req.page_id)
         if not page:
+            logger.warning("[API] Page not found: %s", req.page_id)
             raise HTTPException(status_code=404, detail="Page not found")
 
         owner_id = page.get("owner_id")
@@ -50,9 +76,11 @@ async def agent_run(req: AgentRunRequest):
         if inference_mode not in ("economy", "speed"):
             inference_mode = "economy"
 
-        # Fire-and-forget: the task runs inside run_orchestrator's own
-        # semaphore + timeout guards. Any exception is caught there and
-        # written to the DB — it never propagates back here.
+        logger.info(
+            "[API] Dispatching agent task — page=%s owner=%s",
+            req.page_id, owner_id,
+        )
+
         asyncio.create_task(
             run_orchestrator(
                 page_id=req.page_id,
@@ -68,5 +96,5 @@ async def agent_run(req: AgentRunRequest):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("[main] /agent/run error: %s", e)
+        logger.error("[API] /agent/run unhandled error: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
