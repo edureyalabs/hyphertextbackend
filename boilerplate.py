@@ -74,7 +74,7 @@ INITIAL_BOILERPLATE = """<!DOCTYPE html>
     <ul class="placeholder-hints">
       <li>attach images, logos or documents</li>
       <li>ask for a landing page, portfolio, app</li>
-      <li>request edits at any time</li>
+      <li>request edits at any time.</li>
     </ul>
   </div>
 </body>
