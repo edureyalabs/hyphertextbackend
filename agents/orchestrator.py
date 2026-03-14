@@ -735,7 +735,7 @@ async def _run_agent(
                 messages=messages,
                 tools=TOOL_DEFINITIONS,
                 tool_choice="auto",
-                max_tokens=8000,
+                max_tokens=16000,
                 temperature=0.3,
             )
         except CodingModelExhaustedError as e:

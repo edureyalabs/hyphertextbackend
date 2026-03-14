@@ -69,7 +69,7 @@ async def chat(
         "max_completion_tokens": max_tokens,
         "temperature":           temperature,
         "extra_body": {
-            "disable_reasoning": True,
+            "disable_reasoning": False,
         },
     }
 
