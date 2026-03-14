@@ -4,22 +4,24 @@ from dotenv import load_dotenv
 load_dotenv()
 
 GROQ_API_KEY         = os.getenv("GROQ_API_KEY")
-ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_API_KEY")   # kept for image vision (claude-haiku)
+ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_API_KEY")
 TOGETHER_API_KEY     = os.getenv("TOGETHER_API_KEY")
 CEREBRAS_API_KEY     = os.getenv("CEREBRAS_API_KEY")
 BRAVE_SEARCH_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY")
+DEEPINFRA_API_KEY    = os.getenv("DEEPINFRA_API_KEY", "")
+DEEPINFRA_BASE_URL   = os.getenv("DEEPINFRA_BASE_URL", "https://api.deepinfra.com/v1/openai")
 
 SUPABASE_URL              = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 # ── Groq: intent classification, planning, conversation, coding fallback ──────
 GROQ_MODELS = {
-    "groq/llama-3.3-70b":    "llama-3.3-70b-versatile",
-    "groq/llama-3.1-8b":     "llama-3.1-8b-instant",
-    "groq/gpt-oss-120b":     "openai/gpt-oss-120b",
+    "groq/llama-3.3-70b": "llama-3.3-70b-versatile",
+    "groq/llama-3.1-8b":  "llama-3.1-8b-instant",
+    "groq/gpt-oss-120b":  "openai/gpt-oss-120b",
 }
 
-# ── Together AI: kept for future use, not used for coding currently ───────────
+# ── Together AI: kept for future use ─────────────────────────────────────────
 TOGETHER_MODELS = {
     "together/glm-5":         "zai-org/GLM-5",
     "together/glm-4.7-flash": "zai-org/GLM-4.7-Flash",
@@ -34,15 +36,21 @@ CEREBRAS_MODELS = {
 
 CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
 
+# ── DeepInfra: kept for future use ───────────────────────────────────────────
+DEEPINFRA_MODELS = {}
+
 # ── Coding model chain ────────────────────────────────────────────────────────
 # Primary:  Cerebras GLM-4.7  — fast, used for ALL coding tasks
 # Fallback: Groq GPT-OSS-120B — triggered after 2 consecutive Cerebras failures
-CODING_MODEL_PRIMARY  = "cerebras/glm-4.7"    # tried up to 2 times
-CODING_MODEL_FALLBACK = "groq/gpt-oss-120b"   # tried up to 2 times if primary fails
+CODING_MODEL_PRIMARY  = "cerebras/glm-4.7"   # tried up to 2 times
+CODING_MODEL_FALLBACK = "groq/gpt-oss-120b"  # tried up to 2 times if primary fails
+
+# ── Anthropic vision model ────────────────────────────────────────────────────
+VISION_MODEL_ID = "anthropic/haiku"           # model_id key for billing table
 
 # ── Internal role aliases ─────────────────────────────────────────────────────
-PLANNING_MODEL      = "groq/llama-3.3-70b"    # planning + intent classification
-CONVERSATION_MODEL  = "groq/llama-3.1-8b"     # lightweight chat replies
+PLANNING_MODEL     = "groq/llama-3.3-70b"    # planning + intent classification
+CONVERSATION_MODEL = "groq/llama-3.1-8b"     # lightweight chat replies
 
 ALL_MODELS = (
     list(GROQ_MODELS.keys())

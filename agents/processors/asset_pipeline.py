@@ -3,15 +3,14 @@
 Asset pipeline — fully async.
 Processes all pending assets for a page concurrently using asyncio.gather.
 Each asset runs in its own isolated async task — one failure never blocks others.
-Storage calls use httpx.AsyncClient to avoid blocking the event loop.
+
+Vision token usage is now billed via deduct_dollar_credits after each analyze_image call.
 """
 
 import asyncio
 import uuid
 import logging
 from typing import Optional
-
-import httpx
 
 from database import (
     get_pending_assets_for_page,
@@ -21,10 +20,12 @@ from database import (
     insert_extracted_image_asset,
     mark_asset_failed,
     get_db,
+    deduct_dollar_credits,
 )
 from agents.processors.image_processor import analyze_image
 from agents.processors.pdf_processor   import extract_pdf
 from agents.processors.docx_processor  import extract_docx
+from config import VISION_MODEL_ID
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,6 @@ async def _process_one(asset: dict, owner_id: str) -> bool:
     """Process a single asset. Returns True on success."""
     asset_id     = asset["id"]
     asset_type   = asset["asset_type"]
-    file_type    = asset["file_type"]
     storage_path = asset.get("storage_path")
 
     try:
@@ -63,7 +63,7 @@ async def _process_one(asset: dict, owner_id: str) -> bool:
             return False
 
         if asset_type == "image":
-            return await _process_image(asset, file_bytes)
+            return await _process_image(asset, file_bytes, owner_id)
         elif asset_type == "document":
             return await _process_document(asset, file_bytes, owner_id)
         else:
@@ -76,11 +76,21 @@ async def _process_one(asset: dict, owner_id: str) -> bool:
         return False
 
 
-async def _process_image(asset: dict, file_bytes: bytes) -> bool:
+async def _process_image(asset: dict, file_bytes: bytes, owner_id: str) -> bool:
     asset_id  = asset["id"]
     file_type = asset["file_type"]
+    page_id   = asset["page_id"]
 
     result = await analyze_image(file_bytes, file_type)
+
+    # Bill vision tokens if we have an owner
+    await _bill_vision_tokens(
+        owner_id=owner_id,
+        input_tokens=result.get("input_tokens", 0),
+        output_tokens=result.get("output_tokens", 0),
+        description=f"Vision analysis: {asset.get('original_file_name', 'image')}",
+        reference_id=asset_id,
+    )
 
     await update_asset_image_result(
         asset_id=asset_id,
@@ -168,6 +178,16 @@ async def _process_embedded_image(img, parent_asset: dict, owner_id: str) -> Non
 
     try:
         vision_result = await analyze_image(img.bytes, img.mime_type)
+
+        # Bill vision tokens for this extracted image too
+        await _bill_vision_tokens(
+            owner_id=owner_id,
+            input_tokens=vision_result.get("input_tokens", 0),
+            output_tokens=vision_result.get("output_tokens", 0),
+            description=f"Vision analysis: extracted image from {parent_asset.get('original_file_name', 'document')}",
+            reference_id=child_id,
+        )
+
         await update_asset_image_result(
             asset_id=child_id,
             vision_description=vision_result["description"],
@@ -183,12 +203,34 @@ async def _process_embedded_image(img, parent_asset: dict, owner_id: str) -> Non
         await mark_asset_failed(child_id, "Vision analysis failed for extracted image")
 
 
+async def _bill_vision_tokens(
+    owner_id: str,
+    input_tokens: int,
+    output_tokens: int,
+    description: str,
+    reference_id: str = None,
+) -> None:
+    """Deduct vision model tokens. Silently skips if no owner or zero tokens."""
+    if not owner_id or (input_tokens == 0 and output_tokens == 0):
+        return
+    try:
+        await deduct_dollar_credits(
+            user_id=owner_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            model_id=VISION_MODEL_ID,
+            description=description,
+            reference_id=reference_id,
+        )
+    except Exception as e:
+        logger.warning("[ASSET PIPELINE] billing failed for vision tokens: %s", e)
+
+
 async def _download_from_storage(storage_path: Optional[str]) -> Optional[bytes]:
     """Download file bytes from Supabase storage via async HTTP."""
     if not storage_path:
         return None
     try:
-        # Use the async Supabase client's storage directly
         db = await get_db()
         response = await db.storage.from_(SUPABASE_STORAGE_BUCKET).download(storage_path)
         return response

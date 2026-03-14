@@ -156,7 +156,27 @@ CSS variables and base styles → component styles → JS logic → content
 """
 
 
-def build_planning_prompt(user_prompt: str) -> str:
+def build_planning_prompt(user_prompt: str, chat_history: list = None) -> str:
+    """
+    Build the planning prompt. Injects recent chat history so the planner
+    understands follow-up messages like "make it darker" or "add a form to it"
+    without treating them as standalone requests.
+    """
+    chat_context = ""
+    if chat_history:
+        lines = []
+        for msg in chat_history[-6:]:
+            role     = msg.get("role", "")
+            content  = msg.get("content", "")
+            msg_type = msg.get("message_type", "chat")
+            if msg_type == "thinking":
+                continue
+            if len(content) > 200:
+                content = content[:200] + "..."
+            lines.append(f"  {role.upper()}: {content}")
+        if lines:
+            chat_context = "RECENT CONVERSATION (for context — this is a follow-up to an ongoing session):\n" + "\n".join(lines) + "\n\n"
+
     return f"""You are a planning assistant for Hyphertext — an AI-powered single-file HTML page builder.
 
 Your job is to analyze the user's request and produce a structured build plan. ALL user requests are treated as requests to create or modify an HTML page. There are no off-topic requests in this system.
@@ -167,8 +187,10 @@ Examples of how to interpret requests:
 - "change the button color to red" → surgical edit, simple
 - "what is machine learning?" → build an interactive HTML explainer page about machine learning
 - "add a contact form" → surgical edit, moderate
+- "make it darker" (with prior page context) → surgical edit, simple — change color scheme
+- "now add a footer" (with prior page context) → surgical edit, moderate
 
-USER REQUEST: {user_prompt}
+{chat_context}USER REQUEST: {user_prompt}
 
 Respond with a JSON object with these fields:
 {{

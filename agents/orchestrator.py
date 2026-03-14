@@ -2,17 +2,46 @@
 """
 Main agent orchestrator — fully async, production-grade concurrency.
 
-Concurrency model
+Fixes applied:
+─────────────────────────────────────────────────────────────────────
+1. Chat history now passed to the planning step so follow-up messages
+   like "make it darker" are correctly understood as surgical edits.
+
+2. Intent classifier retries once on exception instead of silently
+   defaulting to code_change with no context.
+
+3. Planning model retries up to 2 times on failure (was 0 retries).
+
+4. Summary generation retries up to 2 times on failure (was 0 retries).
+
+5. Conversational model retries up to 2 times on failure (was 0 retries).
+
+6. After write_full_file the html_summary is immediately generated from
+   the tool-call parameters so the NEXT edit always has page context.
+   Previously a missing/empty html_summary param caused the next edit
+   to have no context, often triggering an unnecessary full rewrite.
+
+7. str_replace success path now always calls finish implicitly if the
+   model never calls finish — prevents HTML being updated in DB but
+   the completed signal never reaching the frontend.
+
+8. Tool loop nudge message improved — gives the model explicit
+   instruction to call write_full_file with the current html in context
+   so it doesn't hallucinate an empty html param.
+
+9. Planning token counts are now read from actual API responses instead
+   of hardcoded flat estimates.
+
+10. Vision token billing moved to asset_pipeline — no change here but
+    noted for completeness.
+
+Concurrency model (unchanged)
 ─────────────────────────────────────────────────────────────────────
 _AGENT_SEMAPHORE   : max 200 simultaneous agent runs per worker process.
-                     With 4 workers → 800 concurrent agent loops fleet-wide.
 _CEREBRAS_SEMAPHORE: max 150 concurrent Cerebras calls per worker.
 _GROQ_SEMAPHORE    : max 100 concurrent Groq calls per worker.
 
-Each agent run is also wrapped in a 5-minute asyncio.timeout so a stuck
-LLM call never holds a semaphore slot indefinitely.
-
-Coding model chain
+Coding model chain (unchanged)
 ─────────────────────────────────────────────────────────────────────
 Primary:  Cerebras GLM-4.7  — tried up to 2 times
 Fallback: Groq GPT-OSS-120B — tried up to 2 times if Cerebras fails twice
@@ -67,22 +96,18 @@ from config import (
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Process-level semaphores — created once per worker, shared across all
-# concurrent requests handled by that worker's event loop.
+# Process-level semaphores
 # ---------------------------------------------------------------------------
 
-# Total simultaneous agent runs per worker (4 workers → 800 fleet-wide)
-_AGENT_SEMAPHORE = asyncio.Semaphore(200)
-
-# Per-provider LLM concurrency caps — respects rate limits
+_AGENT_SEMAPHORE    = asyncio.Semaphore(200)
 _CEREBRAS_SEMAPHORE = asyncio.Semaphore(150)
 _GROQ_SEMAPHORE     = asyncio.Semaphore(100)
 
-# Max wall-clock seconds for a single agent run (prevents semaphore leaks)
-_AGENT_TIMEOUT_SECONDS = 300
-
-# How many times to attempt each provider before moving to the next
+_AGENT_TIMEOUT_SECONDS    = 300
 _MAX_RETRIES_PER_PROVIDER = 2
+
+# Retries for planning/classification/conversation calls (these have no fallback chain)
+_MAX_PLANNING_RETRIES = 2
 
 
 # ---------------------------------------------------------------------------
@@ -90,27 +115,55 @@ _MAX_RETRIES_PER_PROVIDER = 2
 # ---------------------------------------------------------------------------
 
 async def _call_groq(model_id: str, **kwargs) -> dict:
-    """Call Groq bounded by its semaphore."""
     async with _GROQ_SEMAPHORE:
         return await model_router.chat(model_id=model_id, **kwargs)
 
 
 async def _call_cerebras(model_id: str, **kwargs) -> dict:
-    """Call Cerebras bounded by its semaphore."""
     async with _CEREBRAS_SEMAPHORE:
         return await model_router.chat(model_id=model_id, **kwargs)
 
 
 async def _call_planning_model(**kwargs) -> dict:
-    """Planning/classification calls go to Groq."""
-    async with _GROQ_SEMAPHORE:
-        return await model_router.chat(model_id=PLANNING_MODEL, **kwargs)
+    """
+    Planning/classification calls go to Groq with up to _MAX_PLANNING_RETRIES retries.
+    Raises the last exception if all attempts fail.
+    """
+    last_exc = None
+    for attempt in range(1, _MAX_PLANNING_RETRIES + 1):
+        try:
+            async with _GROQ_SEMAPHORE:
+                return await model_router.chat(model_id=PLANNING_MODEL, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "[orchestrator] Planning model attempt %d/%d failed: %s",
+                attempt, _MAX_PLANNING_RETRIES, str(exc)[:200],
+            )
+            if attempt < _MAX_PLANNING_RETRIES:
+                await asyncio.sleep(0.5 * attempt)  # brief back-off before retry
+    raise last_exc
 
 
 async def _call_conversation_model(**kwargs) -> dict:
-    """Conversation replies go to Groq (lightweight model)."""
-    async with _GROQ_SEMAPHORE:
-        return await model_router.chat(model_id=CONVERSATION_MODEL, **kwargs)
+    """
+    Conversation replies go to Groq with up to _MAX_PLANNING_RETRIES retries.
+    Raises the last exception if all attempts fail.
+    """
+    last_exc = None
+    for attempt in range(1, _MAX_PLANNING_RETRIES + 1):
+        try:
+            async with _GROQ_SEMAPHORE:
+                return await model_router.chat(model_id=CONVERSATION_MODEL, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "[orchestrator] Conversation model attempt %d/%d failed: %s",
+                attempt, _MAX_PLANNING_RETRIES, str(exc)[:200],
+            )
+            if attempt < _MAX_PLANNING_RETRIES:
+                await asyncio.sleep(0.5 * attempt)
+    raise last_exc
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +354,9 @@ async def _classify_intent(user_prompt: str, chat_history: list) -> str:
             return "conversational"
         return "code_change"
     except Exception:
+        # If classification fails after all retries, default to code_change
+        # (better to attempt a build than to drop the request)
+        logger.warning("[orchestrator] Intent classification failed after retries, defaulting to code_change")
         return "code_change"
 
 
@@ -326,14 +382,18 @@ async def _handle_conversational(
         {"role": "system", "content": system_content},
         {"role": "user",   "content": user_prompt},
     ]
-    response = await _call_conversation_model(
-        messages=messages,
-        max_tokens=300,
-        temperature=0.6,
-    )
-    ledger.add(CONVERSATION_MODEL, response["input_tokens"], response["output_tokens"])
+    try:
+        response = await _call_conversation_model(
+            messages=messages,
+            max_tokens=300,
+            temperature=0.6,
+        )
+        ledger.add(CONVERSATION_MODEL, response["input_tokens"], response["output_tokens"])
+        reply = response["content"] or "Happy to help! What would you like to build or change?"
+    except Exception as exc:
+        logger.warning("[orchestrator] Conversation model exhausted: %s", exc)
+        reply = "Happy to help! What would you like to build or change?"
 
-    reply = response["content"] or "Happy to help! What would you like to build or change?"
     await update_message_status(message_id, "completed")
     await insert_assistant_message(page_id, reply)
     await ledger.flush(owner_id, "Conversation reply", message_id)
@@ -421,20 +481,21 @@ async def _generate_summary_if_needed(
         ledger.add(PLANNING_MODEL, response["input_tokens"], response["output_tokens"])
         raw = response["content"] or ""
         try:
-            parsed  = json.loads(raw.strip().lstrip("```json").rstrip("```").strip())
-            summary = parsed.get("html_summary", raw)
+            parsed        = json.loads(raw.strip().lstrip("```json").rstrip("```").strip())
+            summary       = parsed.get("html_summary", raw)
             component_map = parsed.get("component_map", [])
             await update_page_summary_and_map(page_id, summary, component_map)
             return summary
         except Exception:
             await update_page_summary_and_map(page_id, raw, [])
             return raw
-    except Exception:
+    except Exception as exc:
+        logger.warning("[orchestrator] Summary generation failed after retries: %s", exc)
         return ""
 
 
 # ---------------------------------------------------------------------------
-# Inner agent loop — called inside the semaphore + timeout guard
+# Inner agent loop
 # ---------------------------------------------------------------------------
 
 async def _run_agent(
@@ -500,8 +561,6 @@ async def _run_agent(
         await _handle_revert(page_id, message_id, user_prompt, owner_id)
         return
 
-    ledger.add(PLANNING_MODEL, 20, 3)
-
     # ── process pending uploads ───────────────────────────────────────────────
     if owner_id:
         await process_pending_assets(page_id, owner_id)
@@ -532,7 +591,7 @@ async def _run_agent(
     consecutive_clarifications = await get_consecutive_clarification_count(page_id)
     clarification_blocked = consecutive_clarifications >= 2
 
-    # ── planning ──────────────────────────────────────────────────────────────
+    # ── planning — now receives chat_history for follow-up context ────────────
     planning_messages = [
         {
             "role": "system",
@@ -542,15 +601,29 @@ async def _run_agent(
                 "Analyse the user request and return a structured JSON plan."
             ),
         },
-        {"role": "user", "content": build_planning_prompt(user_prompt)},
+        {"role": "user", "content": build_planning_prompt(user_prompt, chat_history=chat_history)},
     ]
-    plan_response = await _call_planning_model(
-        messages=planning_messages,
-        max_tokens=1000,
-        temperature=0.1,
-    )
-    ledger.add(PLANNING_MODEL, plan_response["input_tokens"], plan_response["output_tokens"])
-    plan = _parse_plan(plan_response["content"])
+    try:
+        plan_response = await _call_planning_model(
+            messages=planning_messages,
+            max_tokens=1000,
+            temperature=0.1,
+        )
+        ledger.add(PLANNING_MODEL, plan_response["input_tokens"], plan_response["output_tokens"])
+        plan = _parse_plan(plan_response["content"])
+    except Exception as exc:
+        logger.warning("[orchestrator] Planning failed after retries: %s — using defaults", exc)
+        plan = {
+            "decision": "full_rewrite" if is_new_page else "surgical_edit",
+            "complexity": "moderate",
+            "confidence": 0.5,
+            "needs_clarification": False,
+            "clarification_question": None,
+            "description": "apply requested changes",
+            "changes": [],
+            "needs_web_search": False,
+            "search_query": None,
+        }
 
     if is_new_page:
         plan["decision"] = "full_rewrite"
@@ -692,8 +765,11 @@ async def _run_agent(
         coding_model = used_model
         ledger.add(coding_model, response["input_tokens"], response["output_tokens"])
 
+        # ── model returned text with no tool call ─────────────────────────────
         if not response["tool_calls"]:
             content = (response["content"] or "").strip()
+
+            # If we already made changes, treat text response as implicit finish
             if changes_log:
                 final_summary = content if content else "Edits complete."
                 await snapshot_version(page_id, current_html)
@@ -716,21 +792,27 @@ async def _run_agent(
                 await ledger.flush(owner_id, f"AI edit: {final_summary[:80]}", message_id)
                 return
 
+            # No changes yet and no tool call — nudge with richer context
             if iteration < max_iterations:
                 messages.append({"role": "assistant", "content": content})
                 messages.append({
                     "role": "user",
                     "content": (
-                        "You must call a tool. Do not write prose responses. "
-                        "This is an HTML page builder — call write_full_file to build the page now. "
-                        "Do not explain anything. Just call the tool."
+                        "You MUST call a tool right now. Do not write any prose. "
+                        "This is an HTML page builder — your only job is to call tools.\n"
+                        "- If building or fully rewriting: call write_full_file with the complete HTML document.\n"
+                        "- If making a targeted change: call str_replace with the exact old and new strings.\n"
+                        "- If you need info: call web_search or ask_clarification.\n"
+                        "Call a tool now. The page is waiting."
                     ),
                 })
                 continue
             else:
+                # Max iterations reached with no changes — report failure
                 final_summary = "I wasn't able to complete that. Please try rephrasing your request."
                 break
 
+        # ── process tool calls ────────────────────────────────────────────────
         tool_results_for_messages = []
 
         for tool_call in response["tool_calls"]:
@@ -738,6 +820,7 @@ async def _run_agent(
             args    = tool_call["arguments"]
             tc_id   = tool_call["id"]
 
+            # ── write_full_file ───────────────────────────────────────────────
             if fn_name == "write_full_file":
                 html              = args.get("html", "")
                 summary           = args.get("summary", "Page created.")
@@ -749,7 +832,8 @@ async def _run_agent(
                         "tool_call_id": tc_id,
                         "result": (
                             "ERROR: html field is empty. You MUST provide the complete HTML content "
-                            "in the html parameter. Call write_full_file again with the full HTML."
+                            "in the html parameter. The html must be a full valid document starting "
+                            "with <!DOCTYPE html>. Call write_full_file again with the complete HTML now."
                         ),
                     })
                     continue
@@ -768,8 +852,15 @@ async def _run_agent(
                 await update_page_html(page_id, html)
                 current_html = html
 
+                # Always persist html_summary — generate one from the HTML
+                # if the model didn't provide one, so the next edit has context.
                 if new_html_summary:
                     await update_page_summary_and_map(page_id, new_html_summary, new_component_map)
+                else:
+                    # Fire-and-forget summary generation — don't block the response
+                    asyncio.create_task(
+                        _generate_and_save_summary(page_id, html, ledger=None)
+                    )
 
                 changes_log.append({"tool": "write_full_file", "summary": summary, "success": True})
                 final_summary = summary
@@ -793,6 +884,7 @@ async def _run_agent(
                 await ledger.flush(owner_id, f"AI page build: {summary[:80]}", message_id)
                 return
 
+            # ── str_replace ───────────────────────────────────────────────────
             elif fn_name == "str_replace":
                 old_str = args.get("old_str", "")
                 new_str = args.get("new_str", "")
@@ -808,7 +900,7 @@ async def _run_agent(
                     })
                     tool_results_for_messages.append({
                         "tool_call_id": tc_id,
-                        "result": "Replaced successfully. Continue with the next change or call finish if done.",
+                        "result": "Replaced successfully. Call finish if all edits are done, or call str_replace again for the next change.",
                     })
                 else:
                     changes_log.append({
@@ -826,6 +918,7 @@ async def _run_agent(
                         ),
                     })
 
+            # ── ask_clarification ─────────────────────────────────────────────
             elif fn_name == "ask_clarification":
                 question = args.get("question", "Could you clarify?")
                 await insert_clarification(page_id, message_id, question)
@@ -854,6 +947,7 @@ async def _run_agent(
                 await ledger.flush(owner_id, "Planning (clarification)", message_id)
                 return
 
+            # ── web_search ────────────────────────────────────────────────────
             elif fn_name == "web_search":
                 query = args.get("query", "")
                 search_results = await brave_search(query)
@@ -864,6 +958,7 @@ async def _run_agent(
                     "result": formatted,
                 })
 
+            # ── finish ────────────────────────────────────────────────────────
             elif fn_name == "finish":
                 final_summary = args.get("summary", "Edits complete.")
                 await snapshot_version(page_id, current_html)
@@ -886,6 +981,7 @@ async def _run_agent(
                 await ledger.flush(owner_id, f"AI edit: {final_summary[:80]}", message_id)
                 return
 
+        # ── append assistant + tool results to message history ────────────────
         assistant_msg = {
             "role": "assistant",
             "content": response["content"] or "",
@@ -911,6 +1007,10 @@ async def _run_agent(
             })
 
     # ── max iterations reached ────────────────────────────────────────────────
+    # If we got here with changes made but no explicit finish, still complete cleanly.
+    if changes_log:
+        final_summary = "Done. All changes applied."
+
     await snapshot_version(page_id, current_html)
     await update_message_status(message_id, "completed")
     await insert_assistant_message(page_id, final_summary)
@@ -925,14 +1025,49 @@ async def _run_agent(
         web_searches_used=web_searches_used,
         model_used=coding_model,
         tokens_used=ledger.total_tokens(),
-        success=True,
+        success=bool(changes_log),
         owner_id=owner_id,
     )
     await ledger.flush(owner_id, f"AI edit: {final_summary[:80]}", message_id)
 
 
 # ---------------------------------------------------------------------------
-# Public entry point — semaphore + timeout guards wrap _run_agent
+# Fire-and-forget summary generation (for write_full_file without html_summary)
+# ---------------------------------------------------------------------------
+
+async def _generate_and_save_summary(page_id: str, html: str, ledger=None) -> None:
+    """
+    Generates and persists an html_summary + component_map for a newly written page.
+    Called as a background task — does not block the agent response.
+    A separate ledger is not used here since billing is best-effort for background work.
+    """
+    messages = [
+        {
+            "role": "system",
+            "content": "You analyze HTML pages and produce structured summaries for an AI coding agent.",
+        },
+        {"role": "user", "content": build_summary_generation_prompt(html)},
+    ]
+    try:
+        response = await _call_planning_model(
+            messages=messages,
+            max_tokens=800,
+            temperature=0.1,
+        )
+        raw = response["content"] or ""
+        try:
+            parsed        = json.loads(raw.strip().lstrip("```json").rstrip("```").strip())
+            summary       = parsed.get("html_summary", raw)
+            component_map = parsed.get("component_map", [])
+            await update_page_summary_and_map(page_id, summary, component_map)
+        except Exception:
+            await update_page_summary_and_map(page_id, raw[:2000], [])
+    except Exception as exc:
+        logger.warning("[orchestrator] Background summary generation failed for page %s: %s", page_id, exc)
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
 # ---------------------------------------------------------------------------
 
 async def run_orchestrator(
@@ -940,7 +1075,7 @@ async def run_orchestrator(
     message_id: str,
     user_prompt: str,
     owner_id: str = None,
-    requested_inference_mode: str = None,  # kept for API compat, not used for routing
+    requested_inference_mode: str = None,  # kept for API compat
 ):
     """
     Public entry point called from main.py via asyncio.create_task().

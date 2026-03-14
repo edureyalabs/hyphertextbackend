@@ -3,6 +3,8 @@
 Vision analysis using AsyncAnthropic (claude-haiku).
 A process-level semaphore bounds concurrent Anthropic calls to avoid
 rate-limit errors when many users upload images simultaneously.
+
+Returns token usage alongside analysis so the asset pipeline can bill correctly.
 """
 
 import asyncio
@@ -19,8 +21,6 @@ _client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 VISION_MODEL = "claude-haiku-4-5-20251001"
 
 # Max concurrent Anthropic vision calls per worker process.
-# 4 workers × 50 = 200 simultaneous vision calls across the fleet.
-# Anthropic's default RPM for Haiku is high, but this prevents burst spikes.
 _VISION_SEMAPHORE = asyncio.Semaphore(50)
 
 VISION_PROMPT = """Analyze this image carefully and return a JSON object with the following fields.
@@ -44,10 +44,15 @@ async def analyze_image(image_bytes: bytes, mime_type: str) -> dict:
     """
     Run vision analysis on image bytes.
     Bounded by _VISION_SEMAPHORE — safe to call from hundreds of concurrent tasks.
+
+    Returns dict with analysis fields PLUS:
+      - input_tokens  (int)
+      - output_tokens (int)
+    so the caller can bill accurately.
     """
     supported = {"image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp"}
     if mime_type not in supported:
-        return _svg_placeholder()
+        return {**_svg_placeholder(), "input_tokens": 0, "output_tokens": 0}
 
     b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
 
@@ -76,6 +81,9 @@ async def analyze_image(image_bytes: bytes, mime_type: str) -> dict:
             ],
         )
 
+    input_tokens  = response.usage.input_tokens  if response.usage else 0
+    output_tokens = response.usage.output_tokens if response.usage else 0
+
     raw = response.content[0].text.strip()
 
     if raw.startswith("```"):
@@ -87,14 +95,16 @@ async def analyze_image(image_bytes: bytes, mime_type: str) -> dict:
         data = json.loads(raw)
     except json.JSONDecodeError:
         return {
-            "description": "Image uploaded by user.",
+            "description":      "Image uploaded by user.",
             "detected_objects": [],
-            "contains_people": False,
-            "contains_text": False,
-            "extracted_text": "",
-            "dominant_colors": [],
-            "suggested_use": "other",
-            "alt_text": "Uploaded image",
+            "contains_people":  False,
+            "contains_text":    False,
+            "extracted_text":   "",
+            "dominant_colors":  [],
+            "suggested_use":    "other",
+            "alt_text":         "Uploaded image",
+            "input_tokens":     input_tokens,
+            "output_tokens":    output_tokens,
         }
 
     return {
@@ -106,17 +116,19 @@ async def analyze_image(image_bytes: bytes, mime_type: str) -> dict:
         "dominant_colors":  list(data.get("dominant_colors", [])),
         "suggested_use":    str(data.get("suggested_use", "other")),
         "alt_text":         str(data.get("alt_text", "Uploaded image")),
+        "input_tokens":     input_tokens,
+        "output_tokens":    output_tokens,
     }
 
 
 def _svg_placeholder() -> dict:
     return {
-        "description": "SVG vector image uploaded by user.",
+        "description":      "SVG vector image uploaded by user.",
         "detected_objects": [],
-        "contains_people": False,
-        "contains_text": False,
-        "extracted_text": "",
-        "dominant_colors": [],
-        "suggested_use": "illustration",
-        "alt_text": "SVG image",
+        "contains_people":  False,
+        "contains_text":    False,
+        "extracted_text":   "",
+        "dominant_colors":  [],
+        "suggested_use":    "illustration",
+        "alt_text":         "SVG image",
     }
